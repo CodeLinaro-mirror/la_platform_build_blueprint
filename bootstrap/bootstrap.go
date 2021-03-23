@@ -125,6 +125,7 @@ var (
 
 	generateBuildNinja = pctx.StaticRule("build.ninja",
 		blueprint.RuleParams{
+
 			// TODO: it's kinda ugly that some parameters are computed from
 			// environment variables and some from Ninja parameters, but it's probably
 			// better to not to touch that while Blueprint and Soong are separate
@@ -133,7 +134,10 @@ var (
 			Command: `cd "$$(dirname "$builder")" && ` +
 				`BUILDER="$$PWD/$$(basename "$builder")" && ` +
 				`cd / && ` +
-				`env -i "$$BUILDER" ` +
+				// TODO(b/183527807) env -i clears existing environment variables, revert
+				// and address root cause.
+				// `env -i ` +
+				`"$$BUILDER" ` +
 				`    $extra ` +
 				`    --top "$$TOP" ` +
 				`    --out "$$SOONG_OUTDIR" ` +
