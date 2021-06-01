@@ -17,6 +17,7 @@ package blueprint
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -113,7 +114,7 @@ type Context struct {
 	// cache deps modified to determine whether cachedSortedModuleGroups needs to be recalculated
 	cachedDepsModified bool
 
-	globs    map[string]GlobPath
+	globs    map[globKey]pathtools.GlobResult
 	globLock sync.Mutex
 
 	srcDir         string
@@ -384,7 +385,7 @@ func newContext() *Context {
 		moduleFactories:    make(map[string]ModuleFactory),
 		nameInterface:      NewSimpleNameInterface(),
 		moduleInfo:         make(map[Module]*moduleInfo),
-		globs:              make(map[string]GlobPath),
+		globs:              make(map[globKey]pathtools.GlobResult),
 		fs:                 pathtools.OsFs,
 		finishedMutators:   make(map[*mutatorInfo]bool),
 		ninjaBuildDir:      nil,
@@ -2080,6 +2081,11 @@ func parallelVisit(modules []*moduleInfo, order visitOrderer, limit int,
 			// modules to the modules that would have been unblocked when that module finished, i.e
 			// the reverse of the visitOrderer.
 
+			// In order to reduce duplicated work, once a module has been checked and determined
+			// not to be part of a cycle add it and everything that depends on it to the checked
+			// map.
+			checked := make(map[*moduleInfo]struct{})
+
 			var check func(module, end *moduleInfo) []*moduleInfo
 			check = func(module, end *moduleInfo) []*moduleInfo {
 				if module.waitingCount == -1 {
@@ -2089,6 +2095,10 @@ func parallelVisit(modules []*moduleInfo, order visitOrderer, limit int,
 				if module == end {
 					// This module is the end of the loop, start rolling up the cycle.
 					return []*moduleInfo{module}
+				}
+
+				if _, alreadyChecked := checked[module]; alreadyChecked {
+					return nil
 				}
 
 				for _, dep := range order.propagate(module) {
@@ -2104,6 +2114,7 @@ func parallelVisit(modules []*moduleInfo, order visitOrderer, limit int,
 					}
 				}
 
+				checked[module] = struct{}{}
 				return nil
 			}
 
@@ -2147,9 +2158,8 @@ func cycleError(cycle []*moduleInfo) (errs []error) {
 	for i := len(cycle) - 1; i >= 0; i-- {
 		nextModule := cycle[i]
 		errs = append(errs, &BlueprintError{
-			Err: fmt.Errorf("    %q depends on %q",
-				curModule.Name(),
-				nextModule.Name()),
+			Err: fmt.Errorf("    %s depends on %s",
+				curModule, nextModule),
 			Pos: curModule.pos,
 		})
 		curModule = nextModule
@@ -2254,6 +2264,64 @@ func (c *Context) updateDependencies() (errs []error) {
 	return
 }
 
+type jsonVariationMap map[string]string
+
+type jsonModuleName struct {
+	Name                 string
+	Variations           jsonVariationMap
+	DependencyVariations jsonVariationMap
+}
+
+type jsonDep struct {
+	jsonModuleName
+	Tag string
+}
+
+type jsonModule struct {
+	jsonModuleName
+	Deps      []jsonDep
+	Type      string
+	Blueprint string
+}
+
+func toJsonVariationMap(vm variationMap) jsonVariationMap {
+	return jsonVariationMap(vm)
+}
+
+func jsonModuleNameFromModuleInfo(m *moduleInfo) *jsonModuleName {
+	return &jsonModuleName{
+		Name:                 m.Name(),
+		Variations:           toJsonVariationMap(m.variant.variations),
+		DependencyVariations: toJsonVariationMap(m.variant.dependencyVariations),
+	}
+}
+
+func jsonModuleFromModuleInfo(m *moduleInfo) *jsonModule {
+	return &jsonModule{
+		jsonModuleName: *jsonModuleNameFromModuleInfo(m),
+		Deps:           make([]jsonDep, 0),
+		Type:           m.typeName,
+		Blueprint:      m.relBlueprintsFile,
+	}
+}
+
+func (c *Context) PrintJSONGraph(w io.Writer) {
+	modules := make([]*jsonModule, 0)
+	for _, m := range c.modulesSorted {
+		jm := jsonModuleFromModuleInfo(m)
+		for _, d := range m.directDeps {
+			jm.Deps = append(jm.Deps, jsonDep{
+				jsonModuleName: *jsonModuleNameFromModuleInfo(d.module),
+				Tag:            fmt.Sprintf("%T %+v", d.tag, d.tag),
+			})
+		}
+
+		modules = append(modules, jm)
+	}
+
+	json.NewEncoder(w).Encode(modules)
+}
+
 // PrepareBuildActions generates an internal representation of all the build
 // actions that need to be performed.  This process involves invoking the
 // GenerateBuildActions method on each of the Module objects created during the
@@ -2272,6 +2340,7 @@ func (c *Context) updateDependencies() (errs []error) {
 // by the modules and singletons via the ModuleContext.AddNinjaFileDeps(),
 // SingletonContext.AddNinjaFileDeps(), and PackageContext.AddNinjaFileDeps()
 // methods.
+
 func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs []error) {
 	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
 		c.buildActionsReady = false
