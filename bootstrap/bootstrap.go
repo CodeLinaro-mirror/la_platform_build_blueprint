@@ -17,8 +17,6 @@ package bootstrap
 import (
 	"fmt"
 	"go/build"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -59,7 +57,7 @@ var (
 	compile = pctx.StaticRule("compile",
 		blueprint.RuleParams{
 			Command: "GOROOT='$goRoot' $compileCmd $parallelCompile -o $out.tmp " +
-				"-p $pkgPath -complete $incFlags -pack $in && " +
+				"$debugFlags -p $pkgPath -complete $incFlags -pack $in && " +
 				"if cmp --quiet $out.tmp $out; then rm $out.tmp; else mv -f $out.tmp $out; fi",
 			CommandDeps: []string{"$compileCmd"},
 			Description: "compile $out",
@@ -138,24 +136,18 @@ var (
 				// and address root cause.
 				// `env -i ` +
 				`"$$BUILDER" ` +
-				`    $extra ` +
 				`    --top "$$TOP" ` +
-				`    --out "$$SOONG_OUTDIR" ` +
-				`    --delve_listen "$$SOONG_DELVE" ` +
-				`    --delve_path "$$SOONG_DELVE_PATH" ` +
-				`    -b "$buildDir" ` +
+				`    --out "$buildDir" ` +
 				`    -n "$ninjaBuildDir" ` +
 				`    -d "$out.d" ` +
-				`    -globFile "$globFile" ` +
-				`    -o "$out" ` +
-				`    "$in" `,
+				`    $extra`,
 			CommandDeps: []string{"$builder"},
 			Description: "$builder $out",
 			Deps:        blueprint.DepsGCC,
 			Depfile:     "$out.d",
 			Restat:      true,
 		},
-		"builder", "extra", "generator", "globFile")
+		"builder", "extra")
 
 	// Work around a Ninja issue.  See https://github.com/martine/ninja/pull/634
 	phony = pctx.StaticRule("phony",
@@ -167,7 +159,7 @@ var (
 		"depfile")
 
 	_ = pctx.VariableFunc("BinDir", func(config interface{}) (string, error) {
-		return bootstrapBinDir(), nil
+		return bootstrapBinDir(config), nil
 	})
 
 	_ = pctx.VariableFunc("ToolDir", func(config interface{}) (string, error) {
@@ -190,15 +182,15 @@ type GoBinaryTool interface {
 	isGoBinary()
 }
 
-func bootstrapBinDir() string {
-	return filepath.Join(BuildDir, bootstrapSubDir, "bin")
+func bootstrapBinDir(config interface{}) string {
+	return filepath.Join(config.(BootstrapConfig).BuildDir(), bootstrapSubDir, "bin")
 }
 
 func toolDir(config interface{}) string {
 	if c, ok := config.(ConfigBlueprintToolLocation); ok {
 		return filepath.Join(c.BlueprintToolLocation())
 	}
-	return filepath.Join(BuildDir, "bin")
+	return filepath.Join(config.(BootstrapConfig).BuildDir(), "bin")
 }
 
 func pluginDeps(ctx blueprint.BottomUpMutatorContext) {
@@ -712,71 +704,48 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 			}
 		})
 
-	var extraSharedFlagArray []string
-	if s.config.runGoTests {
-		extraSharedFlagArray = append(extraSharedFlagArray, "-t")
-	}
-	if s.config.moduleListFile != "" {
-		extraSharedFlagArray = append(extraSharedFlagArray, "-l", s.config.moduleListFile)
-	}
-	if s.config.emptyNinjaFile {
-		extraSharedFlagArray = append(extraSharedFlagArray, "--empty-ninja-file")
-	}
-	extraSharedFlagString := strings.Join(extraSharedFlagArray, " ")
+	var primaryBuilderCmdlinePrefix []string
+	var primaryBuilderName string
 
-	var primaryBuilderName, primaryBuilderExtraFlags string
-	switch len(primaryBuilders) {
-	case 0:
+	if len(primaryBuilders) == 0 {
 		// If there's no primary builder module then that means we'll use minibp
 		// as the primary builder.  We can trigger its primary builder mode with
 		// the -p flag.
 		primaryBuilderName = "minibp"
-		primaryBuilderExtraFlags = "-p " + extraSharedFlagString
-
-	case 1:
-		primaryBuilderName = ctx.ModuleName(primaryBuilders[0])
-		primaryBuilderExtraFlags = extraSharedFlagString
-
-	default:
+		primaryBuilderCmdlinePrefix = append(primaryBuilderCmdlinePrefix, "-p")
+	} else if len(primaryBuilders) > 1 {
 		ctx.Errorf("multiple primary builder modules present:")
 		for _, primaryBuilder := range primaryBuilders {
 			ctx.ModuleErrorf(primaryBuilder, "<-- module %s",
 				ctx.ModuleName(primaryBuilder))
 		}
 		return
+	} else {
+		primaryBuilderName = ctx.ModuleName(primaryBuilders[0])
 	}
 
 	primaryBuilderFile := filepath.Join("$BinDir", primaryBuilderName)
-
-	// Get the filename of the top-level Blueprints file to pass to minibp.
-	topLevelBlueprints := filepath.Join("$srcDir",
-		filepath.Base(s.config.topLevelBlueprintsFile))
 	ctx.SetNinjaBuildDir(pctx, "${ninjaBuildDir}")
 
 	if s.config.stage == StagePrimary {
-		mainNinjaFile := filepath.Join("$buildDir", "build.ninja")
-		primaryBuilderNinjaGlobFile := absolutePath(filepath.Join(BuildDir, bootstrapSubDir, "build-globs.ninja"))
+		ctx.AddSubninja(s.config.globFile)
 
-		if _, err := os.Stat(primaryBuilderNinjaGlobFile); os.IsNotExist(err) {
-			err = ioutil.WriteFile(primaryBuilderNinjaGlobFile, nil, 0666)
-			if err != nil {
-				ctx.Errorf("Failed to create empty ninja file: %s", err)
-			}
+		for _, i := range s.config.primaryBuilderInvocations {
+			flags := make([]string, 0)
+			flags = append(flags, primaryBuilderCmdlinePrefix...)
+			flags = append(flags, i.Args...)
+
+			// Build the main build.ninja
+			ctx.Build(pctx, blueprint.BuildParams{
+				Rule:    generateBuildNinja,
+				Outputs: i.Outputs,
+				Inputs:  i.Inputs,
+				Args: map[string]string{
+					"builder": primaryBuilderFile,
+					"extra":   strings.Join(flags, " "),
+				},
+			})
 		}
-
-		ctx.AddSubninja(primaryBuilderNinjaGlobFile)
-
-		// Build the main build.ninja
-		ctx.Build(pctx, blueprint.BuildParams{
-			Rule:    generateBuildNinja,
-			Outputs: []string{mainNinjaFile},
-			Inputs:  []string{topLevelBlueprints},
-			Args: map[string]string{
-				"builder":  primaryBuilderFile,
-				"extra":    primaryBuilderExtraFlags,
-				"globFile": primaryBuilderNinjaGlobFile,
-			},
-		})
 	}
 
 	if s.config.stage == StageMain {
@@ -799,8 +768,8 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 		docsFile := filepath.Join(docsDir, primaryBuilderName+".html")
 		bigbpDocs := ctx.Rule(pctx, "bigbpDocs",
 			blueprint.RuleParams{
-				Command: fmt.Sprintf("%s %s -b $buildDir --docs $out %s", primaryBuilderFile,
-					primaryBuilderExtraFlags, topLevelBlueprints),
+				Command: fmt.Sprintf("%s -b $buildDir --docs $out %s", primaryBuilderFile,
+					s.config.topLevelBlueprintsFile),
 				CommandDeps: []string{primaryBuilderFile},
 				Description: fmt.Sprintf("%s docs $out", primaryBuilderName),
 			})
