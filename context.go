@@ -747,7 +747,6 @@ func (c *Context) ParseFileList(rootDir string, filePaths []string,
 
 	type newModuleInfo struct {
 		*moduleInfo
-		deps  []string
 		added chan<- struct{}
 	}
 
@@ -773,12 +772,12 @@ func (c *Context) ParseFileList(rootDir string, filePaths []string,
 			// registered by name. This allows load hooks to set and/or modify any aspect
 			// of the module (including names) using information that is not available when
 			// the module factory is called.
-			newModules, newDeps, errs := runAndRemoveLoadHooks(c, config, module, &scopedModuleFactories)
+			newModules, errs := runAndRemoveLoadHooks(c, config, module, &scopedModuleFactories)
 			if len(errs) > 0 {
 				return errs
 			}
 
-			moduleCh <- newModuleInfo{module, newDeps, addedCh}
+			moduleCh <- newModuleInfo{module, addedCh}
 			<-addedCh
 			for _, n := range newModules {
 				errs = addModule(n)
@@ -821,7 +820,6 @@ func (c *Context) ParseFileList(rootDir string, filePaths []string,
 		doneCh <- struct{}{}
 	}()
 
-	var hookDeps []string
 loop:
 	for {
 		select {
@@ -829,7 +827,6 @@ loop:
 			errs = append(errs, newErrs...)
 		case module := <-moduleCh:
 			newErrs := c.addModule(module.moduleInfo)
-			hookDeps = append(hookDeps, module.deps...)
 			if module.added != nil {
 				module.added <- struct{}{}
 			}
@@ -844,7 +841,6 @@ loop:
 		}
 	}
 
-	deps = append(deps, hookDeps...)
 	return deps, errs
 }
 
