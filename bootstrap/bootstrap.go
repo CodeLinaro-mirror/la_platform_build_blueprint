@@ -127,7 +127,10 @@ var (
 			Command: `cd "$$(dirname "$builder")" && ` +
 				`BUILDER="$$PWD/$$(basename "$builder")" && ` +
 				`cd / && ` +
-				`env -i "$$BUILDER" ` +
+				// TODO(b/183527807) env -i clears existing environment variables, revert
+				// and address root cause.
+				// `env -i ` +
+				`"$$BUILDER" ` +
 				`    --top "$$TOP" ` +
 				`    --soong_out "$soongOutDir" ` +
 				`    --out "$outDir" ` +
