@@ -34,6 +34,7 @@ import (
 	"text/scanner"
 	"text/template"
 
+	"github.com/google/blueprint/metrics"
 	"github.com/google/blueprint/parser"
 	"github.com/google/blueprint/pathtools"
 	"github.com/google/blueprint/proptools"
@@ -71,7 +72,9 @@ const MockModuleListFile = "bplist"
 type Context struct {
 	context.Context
 
-	// set at instantiation
+	// Used for metrics-related event logging.
+	EventHandler *metrics.EventHandler
+
 	moduleFactories     map[string]ModuleFactory
 	nameInterface       NameInterface
 	moduleGroups        []*moduleGroup
@@ -380,8 +383,10 @@ type mutatorInfo struct {
 }
 
 func newContext() *Context {
+	eventHandler := metrics.EventHandler{}
 	return &Context{
 		Context:            context.Background(),
+		EventHandler:       &eventHandler,
 		moduleFactories:    make(map[string]ModuleFactory),
 		nameInterface:      NewSimpleNameInterface(),
 		moduleInfo:         make(map[Module]*moduleInfo),
@@ -686,6 +691,7 @@ func (c *Context) ListModulePaths(baseDir string) (paths []string, err error) {
 	if err != nil {
 		return nil, err
 	}
+	defer reader.Close()
 	bytes, err := ioutil.ReadAll(reader)
 	if err != nil {
 		return nil, err
@@ -1537,6 +1543,8 @@ func (c *Context) addModule(module *moduleInfo) []error {
 // the modules depended upon are defined and that no circular dependencies
 // exist.
 func (c *Context) ResolveDependencies(config interface{}) (deps []string, errs []error) {
+	c.BeginEvent("resolve_deps")
+	defer c.EndEvent("resolve_deps")
 	return c.resolveDependencies(c.Context, config)
 }
 
@@ -2297,26 +2305,6 @@ type JSONDataSupplier interface {
 	AddJSONData(d *map[string]interface{})
 }
 
-// A JSONDataAction contains the inputs and outputs of actions of a module. Which helps pass such
-// data to be included in the JSON module graph.
-type JSONDataAction struct {
-	Inputs  []string
-	Outputs []string
-}
-
-// FormatJSONDataActions puts the content of a list of JSONDataActions into a standard format to be
-// appended into the JSON module graph.
-func FormatJSONDataActions(jsonDataActions []JSONDataAction) []map[string]interface{} {
-	var actions []map[string]interface{}
-	for _, jsonDataAction := range jsonDataActions {
-		actions = append(actions, map[string]interface{}{
-			"Inputs":  jsonDataAction.Inputs,
-			"Outputs": jsonDataAction.Outputs,
-		})
-	}
-	return actions
-}
-
 func jsonModuleFromModuleInfo(m *moduleInfo) *JsonModule {
 	result := &JsonModule{
 		jsonModuleName: *jsonModuleNameFromModuleInfo(m),
@@ -2325,11 +2313,9 @@ func jsonModuleFromModuleInfo(m *moduleInfo) *JsonModule {
 		Blueprint:      m.relBlueprintsFile,
 		Module:         make(map[string]interface{}),
 	}
-
 	if j, ok := m.logicModule.(JSONDataSupplier); ok {
 		j.AddJSONData(&result.Module)
 	}
-
 	for _, p := range m.providers {
 		if j, ok := p.(JSONDataSupplier); ok {
 			j.AddJSONData(&result.Module)
@@ -2338,20 +2324,68 @@ func jsonModuleFromModuleInfo(m *moduleInfo) *JsonModule {
 	return result
 }
 
-func (c *Context) PrintJSONGraph(w io.Writer) {
-	modules := make([]*JsonModule, 0)
+func jsonModuleWithActionsFromModuleInfo(m *moduleInfo) *JsonModule {
+	result := &JsonModule{
+		jsonModuleName: jsonModuleName{
+			Name: m.Name(),
+		},
+		Deps:      make([]jsonDep, 0),
+		Type:      m.typeName,
+		Blueprint: m.relBlueprintsFile,
+		Module:    make(map[string]interface{}),
+	}
+	var actions []map[string]interface{}
+	for _, bDef := range m.actionDefs.buildDefs {
+		actions = append(actions, map[string]interface{}{
+			"Inputs": append(
+				getNinjaStringsWithNilPkgNames(bDef.Inputs),
+				getNinjaStringsWithNilPkgNames(bDef.Implicits)...),
+			"Outputs": append(
+				getNinjaStringsWithNilPkgNames(bDef.Outputs),
+				getNinjaStringsWithNilPkgNames(bDef.ImplicitOutputs)...),
+		})
+	}
+	result.Module["Actions"] = actions
+	return result
+}
+
+// Gets a list of strings from the given list of ninjaStrings by invoking ninjaString.Value with
+// nil pkgNames on each of the input ninjaStrings.
+func getNinjaStringsWithNilPkgNames(nStrs []ninjaString) []string {
+	var strs []string
+	for _, nstr := range nStrs {
+		strs = append(strs, nstr.Value(nil))
+	}
+	return strs
+}
+
+// PrintJSONGraph prints info of modules in a JSON file.
+func (c *Context) PrintJSONGraphAndActions(wGraph io.Writer, wActions io.Writer) {
+	modulesToGraph := make([]*JsonModule, 0)
+	modulesToActions := make([]*JsonModule, 0)
 	for _, m := range c.modulesSorted {
 		jm := jsonModuleFromModuleInfo(m)
+		jmWithActions := jsonModuleWithActionsFromModuleInfo(m)
 		for _, d := range m.directDeps {
 			jm.Deps = append(jm.Deps, jsonDep{
 				jsonModuleName: *jsonModuleNameFromModuleInfo(d.module),
 				Tag:            fmt.Sprintf("%T %+v", d.tag, d.tag),
 			})
+			jmWithActions.Deps = append(jmWithActions.Deps, jsonDep{
+				jsonModuleName: jsonModuleName{
+					Name: d.module.Name(),
+				},
+			})
+
 		}
-
-		modules = append(modules, jm)
+		modulesToGraph = append(modulesToGraph, jm)
+		modulesToActions = append(modulesToActions, jmWithActions)
 	}
+	writeJson(wGraph, modulesToGraph)
+	writeJson(wActions, modulesToActions)
+}
 
+func writeJson(w io.Writer, modules []*JsonModule) {
 	e := json.NewEncoder(w)
 	e.SetIndent("", "\t")
 	e.Encode(modules)
@@ -2377,6 +2411,8 @@ func (c *Context) PrintJSONGraph(w io.Writer) {
 // methods.
 
 func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs []error) {
+	c.BeginEvent("prepare_build_actions")
+	defer c.EndEvent("prepare_build_actions")
 	pprof.Do(c.Context, pprof.Labels("blueprint", "PrepareBuildActions"), func(ctx context.Context) {
 		c.buildActionsReady = false
 
@@ -4077,6 +4113,14 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 	}
 
 	return nil
+}
+
+func (c *Context) BeginEvent(name string) {
+	c.EventHandler.Begin(name)
+}
+
+func (c *Context) EndEvent(name string) {
+	c.EventHandler.End(name)
 }
 
 func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
