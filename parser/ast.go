@@ -189,6 +189,7 @@ const (
 	ListType
 	MapType
 	NotEvaluatedType
+	UnsetType
 )
 
 func (t Type) String() string {
@@ -205,6 +206,8 @@ func (t Type) String() string {
 		return "map"
 	case NotEvaluatedType:
 		return "notevaluated"
+	case UnsetType:
+		return "unset"
 	default:
 		panic(fmt.Errorf("Unknown type %d", t))
 	}
@@ -567,3 +570,124 @@ func endPos(pos scanner.Position, n int) scanner.Position {
 	pos.Column += n
 	return pos
 }
+
+type SelectType int
+
+const (
+	SelectTypeUnconfigured SelectType = iota // Used for selects with only one branch, which is "default"
+	SelectTypeReleaseVariable
+	SelectTypeSoongConfigVariable
+	SelectTypeProductVariable
+	SelectTypeVariant
+)
+
+func (s SelectType) String() string {
+	switch s {
+	case SelectTypeUnconfigured:
+		return "unconfigured"
+	case SelectTypeReleaseVariable:
+		return "release variable"
+	case SelectTypeSoongConfigVariable:
+		return "soong config variable"
+	case SelectTypeProductVariable:
+		return "product variable"
+	case SelectTypeVariant:
+		return "variant"
+	default:
+		panic("unreachable")
+	}
+}
+
+type Select struct {
+	KeywordPos     scanner.Position // the keyword "select"
+	Typ            SelectType
+	Condition      String
+	LBracePos      scanner.Position
+	RBracePos      scanner.Position
+	Cases          []*SelectCase // the case statements
+	Append         Expression
+	ExpressionType Type
+}
+
+func (s *Select) Pos() scanner.Position { return s.KeywordPos }
+func (s *Select) End() scanner.Position { return endPos(s.RBracePos, 1) }
+
+func (s *Select) Copy() Expression {
+	ret := *s
+	ret.Cases = make([]*SelectCase, len(ret.Cases))
+	for i, selectCase := range s.Cases {
+		ret.Cases[i] = selectCase.Copy()
+	}
+	if s.Append != nil {
+		ret.Append = s.Append.Copy()
+	}
+	return &ret
+}
+
+func (s *Select) Eval() Expression {
+	return s
+}
+
+func (s *Select) String() string {
+	return "<select>"
+}
+
+func (s *Select) Type() Type {
+	if s.ExpressionType == UnsetType && s.Append != nil {
+		return s.Append.Type()
+	}
+	return s.ExpressionType
+}
+
+type SelectCase struct {
+	// TODO: Support int and bool typed cases
+	Pattern  String
+	ColonPos scanner.Position
+	Value    Expression
+}
+
+func (c *SelectCase) Copy() *SelectCase {
+	ret := *c
+	ret.Value = c.Value.Copy()
+	return &ret
+}
+
+func (c *SelectCase) String() string {
+	return "<select case>"
+}
+
+func (c *SelectCase) Pos() scanner.Position { return c.Pattern.LiteralPos }
+func (c *SelectCase) End() scanner.Position { return c.Value.End() }
+
+// UnsetProperty is the expression type of the "unset" keyword that can be
+// used in select statements to make the property unset. For example:
+//
+//	my_module_type {
+//	  name: "foo",
+//	  some_prop: select(soong_config_variable("my_namespace", "my_var"), {
+//	    "foo": unset,
+//	    "default": "bar",
+//	  })
+//	}
+type UnsetProperty struct {
+	Position scanner.Position
+}
+
+func (n UnsetProperty) Copy() Expression {
+	return UnsetProperty{Position: n.Position}
+}
+
+func (n UnsetProperty) String() string {
+	return "unset"
+}
+
+func (n UnsetProperty) Type() Type {
+	return UnsetType
+}
+
+func (n UnsetProperty) Eval() Expression {
+	return UnsetProperty{Position: n.Position}
+}
+
+func (n UnsetProperty) Pos() scanner.Position { return n.Position }
+func (n UnsetProperty) End() scanner.Position { return n.Position }

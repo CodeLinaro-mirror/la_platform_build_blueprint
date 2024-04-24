@@ -20,6 +20,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/google/blueprint/parser"
 )
 
 type appendPropertyTestCase struct {
@@ -1168,9 +1170,7 @@ func appendPropertiesTestCases() []appendPropertyTestCase {
 			out: &struct{ S string }{
 				S: "string1string2",
 			},
-			filter: func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (bool, error) {
+			filter: func(dstField, srcField reflect.StructField) (bool, error) {
 				return true, nil
 			},
 		},
@@ -1185,9 +1185,7 @@ func appendPropertiesTestCases() []appendPropertyTestCase {
 			out: &struct{ S string }{
 				S: "string1",
 			},
-			filter: func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (bool, error) {
+			filter: func(dstField, srcField reflect.StructField) (bool, error) {
 				return false, nil
 			},
 		},
@@ -1202,12 +1200,8 @@ func appendPropertiesTestCases() []appendPropertyTestCase {
 			out: &struct{ S string }{
 				S: "string1string2",
 			},
-			filter: func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (bool, error) {
-				return property == "s" &&
-					dstField.Name == "S" && srcField.Name == "S" &&
-					dstValue.(string) == "string1" && srcValue.(string) == "string2", nil
+			filter: func(dstField, srcField reflect.StructField) (bool, error) {
+				return dstField.Name == "S" && srcField.Name == "S", nil
 			},
 		},
 		{
@@ -1257,12 +1251,95 @@ func appendPropertiesTestCases() []appendPropertyTestCase {
 			out: &struct{ S string }{
 				S: "string1",
 			},
-			filter: func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (bool, error) {
+			filter: func(dstField, srcField reflect.StructField) (bool, error) {
 				return true, fmt.Errorf("filter error")
 			},
 			err: extendPropertyErrorf("s", "filter error"),
+		},
+		{
+			name: "Append configurable",
+			dst: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeSoongConfigVariable,
+					condition: "foo",
+					cases: map[string]*[]string{
+						"a": {"1", "2"},
+					},
+					appendWrapper: &appendWrapper[[]string]{},
+				},
+			},
+			src: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeReleaseVariable,
+					condition: "bar",
+					cases: map[string]*[]string{
+						"b": {"3", "4"},
+					},
+					appendWrapper: &appendWrapper[[]string]{},
+				},
+			},
+			out: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeSoongConfigVariable,
+					condition: "foo",
+					cases: map[string]*[]string{
+						"a": {"1", "2"},
+					},
+					appendWrapper: &appendWrapper[[]string]{
+						append: Configurable[[]string]{
+							typ:       parser.SelectTypeReleaseVariable,
+							condition: "bar",
+							cases: map[string]*[]string{
+								"b": {"3", "4"},
+							},
+							appendWrapper: &appendWrapper[[]string]{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "Prepend configurable",
+			order: Prepend,
+			dst: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeSoongConfigVariable,
+					condition: "foo",
+					cases: map[string]*[]string{
+						"a": {"1", "2"},
+					},
+					appendWrapper: &appendWrapper[[]string]{},
+				},
+			},
+			src: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeReleaseVariable,
+					condition: "bar",
+					cases: map[string]*[]string{
+						"b": {"3", "4"},
+					},
+					appendWrapper: &appendWrapper[[]string]{},
+				},
+			},
+			out: &struct{ S Configurable[[]string] }{
+				S: Configurable[[]string]{
+					typ:       parser.SelectTypeReleaseVariable,
+					condition: "bar",
+					cases: map[string]*[]string{
+						"b": {"3", "4"},
+					},
+					appendWrapper: &appendWrapper[[]string]{
+						append: Configurable[[]string]{
+							typ:       parser.SelectTypeSoongConfigVariable,
+							condition: "foo",
+							cases: map[string]*[]string{
+								"a": {"1", "2"},
+							},
+							appendWrapper: &appendWrapper[[]string]{},
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -1300,9 +1377,7 @@ func TestExtendProperties(t *testing.T) {
 			var err error
 			var testType string
 
-			order := func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (Order, error) {
+			order := func(dstField, srcField reflect.StructField) (Order, error) {
 				switch testCase.order {
 				case Append:
 					return Append, nil
@@ -1764,9 +1839,7 @@ func TestExtendMatchingProperties(t *testing.T) {
 			var err error
 			var testType string
 
-			order := func(property string,
-				dstField, srcField reflect.StructField,
-				dstValue, srcValue interface{}) (Order, error) {
+			order := func(dstField, srcField reflect.StructField) (Order, error) {
 				switch testCase.order {
 				case Append:
 					return Append, nil

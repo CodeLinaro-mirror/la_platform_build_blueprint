@@ -16,25 +16,28 @@ package blueprint
 
 import (
 	"bytes"
+	"cmp"
 	"context"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"io/ioutil"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/pprof"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"text/scanner"
 	"text/template"
+	"unsafe"
 
 	"github.com/google/blueprint/metrics"
 	"github.com/google/blueprint/parser"
@@ -99,8 +102,10 @@ type Context struct {
 	// set by SetAllowMissingDependencies
 	allowMissingDependencies bool
 
+	verifyProvidersAreUnchanged bool
+
 	// set during PrepareBuildActions
-	pkgNames        map[*packageContext]string
+	nameTracker     *nameTracker
 	liveGlobals     *liveTracker
 	globalVariables map[Variable]*ninjaString
 	globalPools     map[Pool]*poolDef
@@ -339,17 +344,23 @@ type moduleInfo struct {
 	waitingCount int
 
 	// set during each runMutator
-	splitModules modulesOrAliases
+	splitModules           modulesOrAliases
+	obsoletedByNewVariants bool
 
 	// Used by TransitionMutator implementations
 	transitionVariations     []string
 	currentTransitionMutator string
 	requiredVariationsLock   sync.Mutex
 
+	// outgoingTransitionCache stores the final variation for each dependency, indexed by the source variation
+	// index in transitionVariations and then by the index of the dependency in directDeps
+	outgoingTransitionCache [][]string
+
 	// set during PrepareBuildActions
 	actionDefs localBuildActions
 
-	providers []interface{}
+	providers                  []interface{}
+	providerInitialValueHashes []uint64
 
 	startedMutator  *mutatorInfo
 	finishedMutator *mutatorInfo
@@ -413,15 +424,7 @@ type Variation struct {
 type variationMap map[string]string
 
 func (vm variationMap) clone() variationMap {
-	if vm == nil {
-		return nil
-	}
-	newVm := make(variationMap)
-	for k, v := range vm {
-		newVm[k] = v
-	}
-
-	return newVm
+	return maps.Clone(vm)
 }
 
 // Compare this variationMap to another one.  Returns true if the every entry in this map
@@ -436,7 +439,7 @@ func (vm variationMap) subsetOf(other variationMap) bool {
 }
 
 func (vm variationMap) equal(other variationMap) bool {
-	return reflect.DeepEqual(vm, other)
+	return maps.Equal(vm, other)
 }
 
 type singletonInfo struct {
@@ -461,20 +464,21 @@ type mutatorInfo struct {
 func newContext() *Context {
 	eventHandler := metrics.EventHandler{}
 	return &Context{
-		Context:            context.Background(),
-		EventHandler:       &eventHandler,
-		moduleFactories:    make(map[string]ModuleFactory),
-		nameInterface:      NewSimpleNameInterface(),
-		moduleInfo:         make(map[Module]*moduleInfo),
-		globs:              make(map[globKey]pathtools.GlobResult),
-		fs:                 pathtools.OsFs,
-		finishedMutators:   make(map[*mutatorInfo]bool),
-		includeTags:        &IncludeTags{},
-		sourceRootDirs:     &SourceRootDirs{},
-		outDir:             nil,
-		requiredNinjaMajor: 1,
-		requiredNinjaMinor: 7,
-		requiredNinjaMicro: 0,
+		Context:                     context.Background(),
+		EventHandler:                &eventHandler,
+		moduleFactories:             make(map[string]ModuleFactory),
+		nameInterface:               NewSimpleNameInterface(),
+		moduleInfo:                  make(map[Module]*moduleInfo),
+		globs:                       make(map[globKey]pathtools.GlobResult),
+		fs:                          pathtools.OsFs,
+		finishedMutators:            make(map[*mutatorInfo]bool),
+		includeTags:                 &IncludeTags{},
+		sourceRootDirs:              &SourceRootDirs{},
+		outDir:                      nil,
+		requiredNinjaMajor:          1,
+		requiredNinjaMinor:          7,
+		requiredNinjaMicro:          0,
+		verifyProvidersAreUnchanged: true,
 	}
 }
 
@@ -685,19 +689,39 @@ type IncomingTransitionContext interface {
 	// Config returns the config object that was passed to
 	// Context.PrepareBuildActions.
 	Config() interface{}
+
+	// Provider returns the value for a provider for the target of the dependency edge for which the
+	// transition is being computed.  If the value is not set it returns nil and false.  It panics if
+	// called  before the appropriate mutator or GenerateBuildActions pass for the provider.  The value
+	// returned may be a deep copy of the value originally passed to SetProvider.
+	//
+	// This method shouldn't be used directly, prefer the type-safe android.ModuleProvider instead.
+	Provider(provider AnyProviderKey) (any, bool)
 }
 
 type OutgoingTransitionContext interface {
-	// Module returns the target of the dependency edge for which the transition
+	// Module returns the source of the dependency edge for which the transition
 	// is being computed
 	Module() Module
 
 	// DepTag() Returns the dependency tag through which this dependency is
 	// reached
 	DepTag() DependencyTag
+
+	// Config returns the config object that was passed to
+	// Context.PrepareBuildActions.
+	Config() interface{}
+
+	// Provider returns the value for a provider for the source of the dependency edge for which the
+	// transition is being computed.  If the value is not set it returns nil and false.  It panics if
+	// called before the appropriate mutator or GenerateBuildActions pass for the provider.  The value
+	// returned may be a deep copy of the value originally passed to SetProvider.
+	//
+	// This method shouldn't be used directly, prefer the type-safe android.ModuleProvider instead.
+	Provider(provider AnyProviderKey) (any, bool)
 }
 
-// Transition mutators implement a top-down mechanism where a module tells its
+// TransitionMutator implements a top-down mechanism where a module tells its
 // direct dependencies what variation they should be built in but the dependency
 // has the final say.
 //
@@ -713,7 +737,7 @@ type OutgoingTransitionContext interface {
 // composition the outgoing transition of module A and the incoming transition
 // of module B.
 //
-// the outgoing transition should not take the properties of the dependency into
+// The outgoing transition should not take the properties of the dependency into
 // account, only those of the module that depends on it. For this reason, the
 // dependency is not even passed into it as an argument. Likewise, the incoming
 // transition should not take the properties of the depending module into
@@ -726,7 +750,7 @@ type OutgoingTransitionContext interface {
 // Soong makes sure that all modules are created in the desired variations and
 // that dependency edges are set up correctly. This ensures that "missing
 // variation" errors do not happen and allows for more flexible changes in the
-// value of the variation among dependency edges (as oppposed to bottom-up
+// value of the variation among dependency edges (as opposed to bottom-up
 // mutators where if module A in variation X depends on module B and module B
 // has that variation X, A must depend on variation X of B)
 //
@@ -755,27 +779,27 @@ type OutgoingTransitionContext interface {
 // thus some way is needed to change it state whereas Bazel creates each
 // configuration of a given configured target anew.
 type TransitionMutator interface {
-	// Returns the set of variations that should be created for a module no matter
+	// Split returns the set of variations that should be created for a module no matter
 	// who depends on it. Used when Make depends on a particular variation or when
 	// the module knows its variations just based on information given to it in
 	// the Blueprint file. This method should not mutate the module it is called
 	// on.
 	Split(ctx BaseModuleContext) []string
 
-	// Called on a module to determine which variation it wants from its direct
-	// dependencies. The dependency itself can override this decision. This method
-	// should not mutate the module itself.
+	// OutgoingTransition is called on a module to determine which variation it wants
+	// from its direct dependencies. The dependency itself can override this decision.
+	// This method should not mutate the module itself.
 	OutgoingTransition(ctx OutgoingTransitionContext, sourceVariation string) string
 
-	// Called on a module to determine which variation it should be in based on
-	// the variation modules that depend on it want. This gives the module a final
-	// say about its own variations. This method should not mutate the module
+	// IncomingTransition is called on a module to determine which variation it should
+	// be in based on the variation modules that depend on it want. This gives the module
+	// a final say about its own variations. This method should not mutate the module
 	// itself.
 	IncomingTransition(ctx IncomingTransitionContext, incomingVariation string) string
 
-	// Called after a module was split into multiple variations on each variation.
-	// It should not split the module any further but adding new dependencies is
-	// fine. Unlike all the other methods on TransitionMutator, this method is
+	// Mutate is called after a module was split into multiple variations on each
+	// variation.  It should not split the module any further but adding new dependencies
+	// is fine. Unlike all the other methods on TransitionMutator, this method is
 	// allowed to mutate the module.
 	Mutate(ctx BottomUpMutatorContext, variation string)
 }
@@ -787,15 +811,10 @@ type transitionMutatorImpl struct {
 
 // Adds each argument in items to l if it's not already there.
 func addToStringListIfNotPresent(l []string, items ...string) []string {
-OUTER:
 	for _, i := range items {
-		for _, existing := range l {
-			if existing == i {
-				continue OUTER
-			}
+		if !slices.Contains(l, i) {
+			l = append(l, i)
 		}
-
-		l = append(l, i)
 	}
 
 	return l
@@ -830,22 +849,25 @@ func (t *transitionMutatorImpl) topDownMutator(mctx TopDownMutatorContext) {
 	module.transitionVariations = addToStringListIfNotPresent(module.transitionVariations, mutatorSplits...)
 	sort.Strings(module.transitionVariations)
 
-	for _, srcVariation := range module.transitionVariations {
-		for _, dep := range module.directDeps {
-			finalVariation := t.transition(mctx)(mctx.Module(), srcVariation, dep.module.logicModule, dep.tag)
+	outgoingTransitionCache := make([][]string, len(module.transitionVariations))
+	for srcVariationIndex, srcVariation := range module.transitionVariations {
+		srcVariationTransitionCache := make([]string, len(module.directDeps))
+		for depIndex, dep := range module.directDeps {
+			finalVariation := t.transition(mctx)(mctx.moduleInfo(), srcVariation, dep.module, dep.tag)
+			srcVariationTransitionCache[depIndex] = finalVariation
 			t.addRequiredVariation(dep.module, finalVariation)
 		}
+		outgoingTransitionCache[srcVariationIndex] = srcVariationTransitionCache
 	}
+	module.outgoingTransitionCache = outgoingTransitionCache
 }
 
 type transitionContextImpl struct {
-	module Module
-	depTag DependencyTag
-	config interface{}
-}
-
-func (c *transitionContextImpl) Module() Module {
-	return c.module
+	context *Context
+	source  *moduleInfo
+	dep     *moduleInfo
+	depTag  DependencyTag
+	config  interface{}
 }
 
 func (c *transitionContextImpl) DepTag() DependencyTag {
@@ -856,11 +878,44 @@ func (c *transitionContextImpl) Config() interface{} {
 	return c.config
 }
 
-func (t *transitionMutatorImpl) transition(mctx BaseMutatorContext) Transition {
-	return func(source Module, sourceVariation string, dep Module, depTag DependencyTag) string {
-		tc := &transitionContextImpl{module: dep, depTag: depTag, config: mctx.Config()}
-		outgoingVariation := t.mutator.OutgoingTransition(tc, sourceVariation)
-		finalVariation := t.mutator.IncomingTransition(tc, outgoingVariation)
+type outgoingTransitionContextImpl struct {
+	transitionContextImpl
+}
+
+func (c *outgoingTransitionContextImpl) Module() Module {
+	return c.source.logicModule
+}
+
+func (c *outgoingTransitionContextImpl) Provider(provider AnyProviderKey) (any, bool) {
+	return c.context.provider(c.source, provider.provider())
+}
+
+type incomingTransitionContextImpl struct {
+	transitionContextImpl
+}
+
+func (c *incomingTransitionContextImpl) Module() Module {
+	return c.dep.logicModule
+}
+
+func (c *incomingTransitionContextImpl) Provider(provider AnyProviderKey) (any, bool) {
+	return c.context.provider(c.dep, provider.provider())
+}
+
+func (t *transitionMutatorImpl) transition(mctx BaseModuleContext) Transition {
+	return func(source *moduleInfo, sourceVariation string, dep *moduleInfo, depTag DependencyTag) string {
+		tc := transitionContextImpl{
+			context: mctx.base().context,
+			source:  source,
+			dep:     dep,
+			depTag:  depTag,
+			config:  mctx.Config(),
+		}
+		outgoingVariation := t.mutator.OutgoingTransition(&outgoingTransitionContextImpl{tc}, sourceVariation)
+		if mctx.Failed() {
+			return outgoingVariation
+		}
+		finalVariation := t.mutator.IncomingTransition(&incomingTransitionContextImpl{tc}, outgoingVariation)
 		return finalVariation
 	}
 }
@@ -871,7 +926,9 @@ func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 	// only time interaction between multiple modules is required is during the
 	// computation of the variations required by a given module.
 	variations := mc.module.transitionVariations
+	outgoingTransitionCache := mc.module.outgoingTransitionCache
 	mc.module.transitionVariations = nil
+	mc.module.outgoingTransitionCache = nil
 	mc.module.currentTransitionMutator = ""
 
 	if len(variations) < 1 {
@@ -881,9 +938,10 @@ func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 
 	if len(variations) == 1 && variations[0] == "" {
 		// Module is not split, just apply the transition
-		mc.applyTransition(t.transition(mctx))
+		mc.context.convertDepsToVariation(mc.module, 0,
+			chooseDepByIndexes(mc.mutator.name, outgoingTransitionCache))
 	} else {
-		mc.createVariationsWithTransition(t.transition(mctx), variations...)
+		mc.createVariationsWithTransition(variations, outgoingTransitionCache)
 	}
 }
 
@@ -931,6 +989,18 @@ func (c *Context) SetIgnoreUnknownModuleTypes(ignoreUnknownModuleTypes bool) {
 // for missing dependencies.
 func (c *Context) SetAllowMissingDependencies(allowMissingDependencies bool) {
 	c.allowMissingDependencies = allowMissingDependencies
+}
+
+// SetVerifyProvidersAreUnchanged makes blueprint hash all providers immediately
+// after SetProvider() is called, and then hash them again after the build finished.
+// If the hashes change, it's an error. Providers are supposed to be immutable, but
+// we don't have any more direct way to enforce that in go.
+func (c *Context) SetVerifyProvidersAreUnchanged(verifyProvidersAreUnchanged bool) {
+	c.verifyProvidersAreUnchanged = verifyProvidersAreUnchanged
+}
+
+func (c *Context) GetVerifyProvidersAreUnchanged() bool {
+	return c.verifyProvidersAreUnchanged
 }
 
 func (c *Context) SetModuleListFile(listFile string) {
@@ -1030,8 +1100,12 @@ func shouldVisitFile(c *Context, file *parser.File) shouldVisitFileInfo {
 	}
 
 	if blueprintPackageIncludes != nil {
-		packageMatches := blueprintPackageIncludes.MatchesIncludeTags(c)
-		if !packageMatches {
+		packageMatches, err := blueprintPackageIncludes.matchesIncludeTags(c)
+		if err != nil {
+			return shouldVisitFileInfo{
+				errs: []error{err},
+			}
+		} else if !packageMatches {
 			return shouldVisitFileInfo{
 				shouldVisitFile: false,
 				skippedModules:  skippedModules,
@@ -1677,12 +1751,12 @@ func newVariant(module *moduleInfo, mutatorName string, variationName string,
 	return variant{newVariantName, newVariations, newDependencyVariations}
 }
 
-func (c *Context) createVariations(origModule *moduleInfo, mutatorName string,
+func (c *Context) createVariations(origModule *moduleInfo, mutator *mutatorInfo,
 	depChooser depChooser, variationNames []string, local bool) (modulesOrAliases, []error) {
 
 	if len(variationNames) == 0 {
 		panic(fmt.Errorf("mutator %q passed zero-length variation list for module %q",
-			mutatorName, origModule.Name()))
+			mutator.name, origModule.Name()))
 	}
 
 	var newModules modulesOrAliases
@@ -1704,17 +1778,18 @@ func (c *Context) createVariations(origModule *moduleInfo, mutatorName string,
 
 		m := *origModule
 		newModule := &m
-		newModule.directDeps = append([]depInfo(nil), origModule.directDeps...)
+		newModule.directDeps = slices.Clone(origModule.directDeps)
 		newModule.reverseDeps = nil
 		newModule.forwardDeps = nil
 		newModule.logicModule = newLogicModule
-		newModule.variant = newVariant(origModule, mutatorName, variationName, local)
+		newModule.variant = newVariant(origModule, mutator.name, variationName, local)
 		newModule.properties = newProperties
-		newModule.providers = append([]interface{}(nil), origModule.providers...)
+		newModule.providers = slices.Clone(origModule.providers)
+		newModule.providerInitialValueHashes = slices.Clone(origModule.providerInitialValueHashes)
 
 		newModules = append(newModules, newModule)
 
-		newErrs := c.convertDepsToVariation(newModule, depChooser)
+		newErrs := c.convertDepsToVariation(newModule, i, depChooser)
 		if len(newErrs) > 0 {
 			errs = append(errs, newErrs...)
 		}
@@ -1722,7 +1797,7 @@ func (c *Context) createVariations(origModule *moduleInfo, mutatorName string,
 
 	// Mark original variant as invalid.  Modules that depend on this module will still
 	// depend on origModule, but we'll fix it when the mutator is called on them.
-	origModule.logicModule = nil
+	origModule.obsoletedByNewVariants = true
 	origModule.splitModules = newModules
 
 	atomic.AddUint32(&c.depsModified, 1)
@@ -1730,37 +1805,12 @@ func (c *Context) createVariations(origModule *moduleInfo, mutatorName string,
 	return newModules, errs
 }
 
-type depChooser func(source *moduleInfo, dep depInfo) (*moduleInfo, string)
+type depChooser func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string)
 
 // This function is called for every dependency edge to determine which
 // variation of the dependency is needed. Its inputs are the depending module,
 // its variation, the dependency and the dependency tag.
-type Transition func(source Module, sourceVariation string, dep Module, depTag DependencyTag) string
-
-func chooseDepByTransition(mutatorName string, transition Transition) depChooser {
-	return func(source *moduleInfo, dep depInfo) (*moduleInfo, string) {
-		sourceVariation := source.variant.variations[mutatorName]
-		depLogicModule := dep.module.logicModule
-		if depLogicModule == nil {
-			// This is really a lie because the original dependency before the split
-			// went away when it was split. We choose an arbitrary split module
-			// instead and hope that whatever information the transition wants from it
-			// is the same as in the original one
-			// TODO(lberki): this can be fixed by calling transition() once and saving
-			// its results somewhere
-			depLogicModule = dep.module.splitModules[0].moduleOrAliasTarget().logicModule
-		}
-
-		desiredVariation := transition(source.logicModule, sourceVariation, depLogicModule, dep.tag)
-		for _, m := range dep.module.splitModules {
-			if m.moduleOrAliasVariant().variations[mutatorName] == desiredVariation {
-				return m.moduleOrAliasTarget(), ""
-			}
-		}
-
-		return nil, desiredVariation
-	}
-}
+type Transition func(source *moduleInfo, sourceVariation string, dep *moduleInfo, depTag DependencyTag) string
 
 func chooseDep(candidates modulesOrAliases, mutatorName, variationName string, defaultVariationName *string) (*moduleInfo, string) {
 	for _, m := range candidates {
@@ -1781,24 +1831,31 @@ func chooseDep(candidates modulesOrAliases, mutatorName, variationName string, d
 	return nil, variationName
 }
 
+func chooseDepByIndexes(mutatorName string, variations [][]string) depChooser {
+	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
+		desiredVariation := variations[variationIndex][depIndex]
+		return chooseDep(dep.module.splitModules, mutatorName, desiredVariation, nil)
+	}
+}
+
 func chooseDepExplicit(mutatorName string,
 	variationName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, dep depInfo) (*moduleInfo, string) {
+	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
 		return chooseDep(dep.module.splitModules, mutatorName, variationName, defaultVariationName)
 	}
 }
 
 func chooseDepInherit(mutatorName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, dep depInfo) (*moduleInfo, string) {
+	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
 		sourceVariation := source.variant.variations[mutatorName]
 		return chooseDep(dep.module.splitModules, mutatorName, sourceVariation, defaultVariationName)
 	}
 }
 
-func (c *Context) convertDepsToVariation(module *moduleInfo, depChooser depChooser) (errs []error) {
+func (c *Context) convertDepsToVariation(module *moduleInfo, variationIndex int, depChooser depChooser) (errs []error) {
 	for i, dep := range module.directDeps {
-		if dep.module.logicModule == nil {
-			newDep, missingVariation := depChooser(module, dep)
+		if dep.module.obsoletedByNewVariants {
+			newDep, missingVariation := depChooser(module, variationIndex, i, dep)
 			if newDep == nil {
 				errs = append(errs, &BlueprintError{
 					Err: fmt.Errorf("failed to find variation %q for module %q needed by %q",
@@ -2741,7 +2798,7 @@ func jsonModuleFromModuleInfo(m *moduleInfo) *JsonModule {
 	return result
 }
 
-func jsonModuleWithActionsFromModuleInfo(m *moduleInfo) *JsonModule {
+func jsonModuleWithActionsFromModuleInfo(m *moduleInfo, nameTracker *nameTracker) *JsonModule {
 	result := &JsonModule{
 		jsonModuleName: jsonModuleName{
 			Name:    m.Name(),
@@ -2758,17 +2815,17 @@ func jsonModuleWithActionsFromModuleInfo(m *moduleInfo) *JsonModule {
 			Inputs: append(append(append(
 				bDef.InputStrings,
 				bDef.ImplicitStrings...),
-				getNinjaStringsWithNilPkgNames(bDef.Inputs)...),
-				getNinjaStringsWithNilPkgNames(bDef.Implicits)...),
+				getNinjaStrings(bDef.Inputs, nameTracker)...),
+				getNinjaStrings(bDef.Implicits, nameTracker)...),
 
 			Outputs: append(append(append(
 				bDef.OutputStrings,
 				bDef.ImplicitOutputStrings...),
-				getNinjaStringsWithNilPkgNames(bDef.Outputs)...),
-				getNinjaStringsWithNilPkgNames(bDef.ImplicitOutputs)...),
+				getNinjaStrings(bDef.Outputs, nameTracker)...),
+				getNinjaStrings(bDef.ImplicitOutputs, nameTracker)...),
 		}
 		if d, ok := bDef.Variables["description"]; ok {
-			a.Desc = d.Value(nil)
+			a.Desc = d.Value(nameTracker)
 		}
 		actions = append(actions, a)
 	}
@@ -2786,12 +2843,11 @@ func jsonModuleWithActionsFromModuleInfo(m *moduleInfo) *JsonModule {
 	return result
 }
 
-// Gets a list of strings from the given list of ninjaStrings by invoking ninjaString.Value with
-// nil pkgNames on each of the input ninjaStrings.
-func getNinjaStringsWithNilPkgNames(nStrs []*ninjaString) []string {
+// Gets a list of strings from the given list of ninjaStrings by invoking ninjaString.Value on each.
+func getNinjaStrings(nStrs []*ninjaString, nameTracker *nameTracker) []string {
 	var strs []string
 	for _, nstr := range nStrs {
-		strs = append(strs, nstr.Value(nil))
+		strs = append(strs, nstr.Value(nameTracker))
 	}
 	return strs
 }
@@ -2799,7 +2855,7 @@ func getNinjaStringsWithNilPkgNames(nStrs []*ninjaString) []string {
 func (c *Context) GetWeightedOutputsFromPredicate(predicate func(*JsonModule) (bool, int)) map[string]int {
 	outputToWeight := make(map[string]int)
 	for _, m := range c.modulesSorted {
-		jmWithActions := jsonModuleWithActionsFromModuleInfo(m)
+		jmWithActions := jsonModuleWithActionsFromModuleInfo(m, c.nameTracker)
 		if ok, weight := predicate(jmWithActions); ok {
 			for _, a := range jmWithActions.Module["Actions"].([]JSONAction) {
 				for _, o := range a.Outputs {
@@ -2831,7 +2887,7 @@ func (c *Context) PrintJSONGraphAndActions(wGraph io.Writer, wActions io.Writer)
 	modulesToActions := make([]*JsonModule, 0)
 	for _, m := range c.modulesSorted {
 		jm := jsonModuleFromModuleInfo(m)
-		jmWithActions := jsonModuleWithActionsFromModuleInfo(m)
+		jmWithActions := jsonModuleWithActionsFromModuleInfo(m, c.nameTracker)
 		for _, d := range m.directDeps {
 			jm.Deps = append(jm.Deps, jsonDep{
 				jsonModuleName: *jsonModuleNameFromModuleInfo(d.module),
@@ -2918,12 +2974,12 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 
 		deps = append(deps, depsPackages...)
 
-		c.memoizeFullNames(c.liveGlobals, pkgNames)
+		nameTracker := c.memoizeFullNames(c.liveGlobals, pkgNames)
 
 		// This will panic if it finds a problem since it's a programming error.
-		c.checkForVariableReferenceCycles(c.liveGlobals.variables, pkgNames)
+		c.checkForVariableReferenceCycles(c.liveGlobals.variables, nameTracker)
 
-		c.pkgNames = pkgNames
+		c.nameTracker = nameTracker
 		c.globalVariables = c.liveGlobals.variables
 		c.globalPools = c.liveGlobals.pools
 		c.globalRules = c.liveGlobals.rules
@@ -3030,6 +3086,11 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 		deps       []string
 	}
 
+	type newVariationPair struct {
+		newVariations   modulesOrAliases
+		origLogicModule Module
+	}
+
 	reverseDeps := make(map[*moduleInfo][]depInfo)
 	var rename []rename
 	var replace []replace
@@ -3037,7 +3098,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 
 	errsCh := make(chan []error)
 	globalStateCh := make(chan globalStateChange)
-	newVariationsCh := make(chan modulesOrAliases)
+	newVariationsCh := make(chan newVariationPair)
 	done := make(chan bool)
 
 	c.depsModified = 0
@@ -3053,9 +3114,11 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 				config:  config,
 				module:  module,
 			},
-			name:    mutator.name,
+			mutator: mutator,
 			pauseCh: pause,
 		}
+
+		origLogicModule := module.logicModule
 
 		module.startedMutator = mutator
 
@@ -3082,7 +3145,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 		}
 
 		if len(mctx.newVariations) > 0 {
-			newVariationsCh <- mctx.newVariations
+			newVariationsCh <- newVariationPair{mctx.newVariations, origLogicModule}
 		}
 
 		if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 {
@@ -3097,6 +3160,8 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 
 		return false
 	}
+
+	var obsoleteLogicModules []Module
 
 	// Process errs and reverseDeps in a single goroutine
 	go func() {
@@ -3113,7 +3178,10 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 				newModules = append(newModules, globalStateChange.newModules...)
 				deps = append(deps, globalStateChange.deps...)
 			case newVariations := <-newVariationsCh:
-				for _, moduleOrAlias := range newVariations {
+				if newVariations.origLogicModule != newVariations.newVariations[0].module().logicModule {
+					obsoleteLogicModules = append(obsoleteLogicModules, newVariations.origLogicModule)
+				}
+				for _, moduleOrAlias := range newVariations.newVariations {
 					if m := moduleOrAlias.module(); m != nil {
 						newModuleInfo[m.logicModule] = m
 					}
@@ -3145,6 +3213,10 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 		return nil, errs
 	}
 
+	for _, obsoleteLogicModule := range obsoleteLogicModules {
+		delete(newModuleInfo, obsoleteLogicModule)
+	}
+
 	c.moduleInfo = newModuleInfo
 
 	for _, group := range c.moduleGroups {
@@ -3163,12 +3235,12 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 			// Fix up any remaining dependencies on modules that were split into variants
 			// by replacing them with the first variant
 			for j, dep := range module.directDeps {
-				if dep.module.logicModule == nil {
+				if dep.module.obsoletedByNewVariants {
 					module.directDeps[j].module = dep.module.splitModules.firstModule()
 				}
 			}
 
-			if module.createdBy != nil && module.createdBy.logicModule == nil {
+			if module.createdBy != nil && module.createdBy.obsoletedByNewVariants {
 				module.createdBy = module.createdBy.splitModules.firstModule()
 			}
 
@@ -3193,7 +3265,7 @@ func (c *Context) runMutator(config interface{}, mutator *mutatorInfo,
 		// change inside the loop
 		for i := 0; i < len(group.modules); i++ {
 			if alias := group.modules[i].alias(); alias != nil {
-				if alias.target.logicModule == nil {
+				if alias.target.obsoletedByNewVariants {
 					newTarget := findAliasTarget(alias.target.variant)
 					if newTarget != nil {
 						alias.target = newTarget
@@ -3519,6 +3591,10 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 		errs = append(errs, newErrs...)
 	}
 
+	// Force a resort of the module groups before running singletons so that two singletons running in parallel
+	// don't cause a data race when they trigger a resort in VisitAllModules.
+	c.sortedModuleGroups()
+
 	// First, take care of any singletons that want to run in parallel.
 	deps, errs = c.generateParallelSingletonBuildActions(config, singletons, liveGlobals)
 
@@ -3781,6 +3857,25 @@ func (c *Context) visitAllModuleVariants(module *moduleInfo,
 	}
 }
 
+func (c *Context) visitAllModuleInfos(visit func(*moduleInfo)) {
+	var module *moduleInfo
+
+	defer func() {
+		if r := recover(); r != nil {
+			panic(newPanicErrorf(r, "VisitAllModules(%s) for %s",
+				funcName(visit), module))
+		}
+	}()
+
+	for _, moduleGroup := range c.sortedModuleGroups() {
+		for _, moduleOrAlias := range moduleGroup.modules {
+			if module = moduleOrAlias.module(); module != nil {
+				visit(module)
+			}
+		}
+	}
+}
+
 func (c *Context) requireNinjaVersion(major, minor, micro int) {
 	if major != 1 {
 		panic("ninja version with major version != 1 not supported")
@@ -3862,20 +3957,27 @@ func (c *Context) makeUniquePackageNames(
 // memoizeFullNames stores the full name of each live global variable, rule and pool since each is
 // guaranteed to be used at least twice, once in the definition and once for each usage, and many
 // are used much more than once.
-func (c *Context) memoizeFullNames(liveGlobals *liveTracker, pkgNames map[*packageContext]string) {
+func (c *Context) memoizeFullNames(liveGlobals *liveTracker, pkgNames map[*packageContext]string) *nameTracker {
+	nameTracker := &nameTracker{
+		pkgNames:  pkgNames,
+		variables: make(map[Variable]string),
+		rules:     make(map[Rule]string),
+		pools:     make(map[Pool]string),
+	}
 	for v := range liveGlobals.variables {
-		v.memoizeFullName(pkgNames)
+		nameTracker.variables[v] = v.fullName(pkgNames)
 	}
 	for r := range liveGlobals.rules {
-		r.memoizeFullName(pkgNames)
+		nameTracker.rules[r] = r.fullName(pkgNames)
 	}
 	for p := range liveGlobals.pools {
-		p.memoizeFullName(pkgNames)
+		nameTracker.pools[p] = p.fullName(pkgNames)
 	}
+	return nameTracker
 }
 
 func (c *Context) checkForVariableReferenceCycles(
-	variables map[Variable]*ninjaString, pkgNames map[*packageContext]string) {
+	variables map[Variable]*ninjaString, nameTracker *nameTracker) {
 
 	visited := make(map[Variable]bool)  // variables that were already checked
 	checking := make(map[Variable]bool) // variables actively being checked
@@ -3905,12 +4007,12 @@ func (c *Context) checkForVariableReferenceCycles(
 						msgs := []string{"detected variable reference cycle:"}
 
 						// Iterate backwards through the cycle list.
-						curName := v.fullName(pkgNames)
-						curValue := value.Value(pkgNames)
+						curName := nameTracker.Variable(v)
+						curValue := value.Value(nameTracker)
 						for i := len(cycle) - 1; i >= 0; i-- {
 							next := cycle[i]
-							nextName := next.fullName(pkgNames)
-							nextValue := variables[next].Value(pkgNames)
+							nextName := nameTracker.Variable(next)
+							nextValue := variables[next].Value(nameTracker)
 
 							msgs = append(msgs, fmt.Sprintf(
 								"    %q depends on %q", curName, nextName))
@@ -3958,7 +4060,7 @@ func (c *Context) AllTargets() (map[string]string, error) {
 	targets := map[string]string{}
 	var collectTargets = func(actionDefs localBuildActions) error {
 		for _, buildDef := range actionDefs.buildDefs {
-			ruleName := buildDef.Rule.fullName(c.pkgNames)
+			ruleName := c.nameTracker.Rule(buildDef.Rule)
 			for _, output := range append(buildDef.Outputs, buildDef.ImplicitOutputs...) {
 				outputValue, err := output.Eval(c.globalVariables)
 				if err != nil {
@@ -4036,22 +4138,12 @@ func (c *Context) ModuleType(logicModule Module) string {
 }
 
 // ModuleProvider returns the value, if any, for the provider for a module.  If the value for the
-// provider was not set it returns the zero value of the type of the provider, which means the
-// return value can always be type-asserted to the type of the provider.  The return value should
-// always be considered read-only.  It panics if called before the appropriate mutator or
-// GenerateBuildActions pass for the provider on the module.  The value returned may be a deep
-// copy of the value originally passed to SetProvider.
-func (c *Context) ModuleProvider(logicModule Module, provider ProviderKey) interface{} {
+// provider was not set it returns nil and false.  The return value should always be considered read-only.
+// It panics if called before the appropriate mutator or GenerateBuildActions pass for the provider on the
+// module.  The value returned may be a deep copy of the value originally passed to SetProvider.
+func (c *Context) ModuleProvider(logicModule Module, provider AnyProviderKey) (any, bool) {
 	module := c.moduleInfo[logicModule]
-	value, _ := c.provider(module, provider)
-	return value
-}
-
-// ModuleHasProvider returns true if the provider for the given module has been set.
-func (c *Context) ModuleHasProvider(logicModule Module, provider ProviderKey) bool {
-	module := c.moduleInfo[logicModule]
-	_, ok := c.provider(module, provider)
-	return ok
+	return c.provider(module, provider.provider())
 }
 
 func (c *Context) BlueprintFile(logicModule Module) string {
@@ -4063,9 +4155,47 @@ func (c *Context) ModuleErrorf(logicModule Module, format string,
 	args ...interface{}) error {
 
 	module := c.moduleInfo[logicModule]
-	return &BlueprintError{
-		Err: fmt.Errorf(format, args...),
-		Pos: module.pos,
+	if module == nil {
+		// This can happen if ModuleErrorf is called from a load hook
+		return &BlueprintError{
+			Err: fmt.Errorf(format, args...),
+		}
+	}
+
+	return &ModuleError{
+		BlueprintError: BlueprintError{
+			Err: fmt.Errorf(format, args...),
+			Pos: module.pos,
+		},
+		module: module,
+	}
+}
+
+func (c *Context) PropertyErrorf(logicModule Module, property string, format string,
+	args ...interface{}) error {
+
+	module := c.moduleInfo[logicModule]
+	if module == nil {
+		// This can happen if PropertyErrorf is called from a load hook
+		return &BlueprintError{
+			Err: fmt.Errorf(format, args...),
+		}
+	}
+
+	pos := module.propertyPos[property]
+	if !pos.IsValid() {
+		pos = module.pos
+	}
+
+	return &PropertyError{
+		ModuleError: ModuleError{
+			BlueprintError: BlueprintError{
+				Err: fmt.Errorf(format, args...),
+				Pos: pos,
+			},
+			module: module,
+		},
+		property: property,
 	}
 }
 
@@ -4188,6 +4318,34 @@ func (c *Context) SingletonName(singleton Singleton) string {
 	return ""
 }
 
+// Checks that the hashes of all the providers match the hashes from when they were first set.
+// Does nothing on success, returns a list of errors otherwise. It's recommended to run this
+// in a goroutine.
+func (c *Context) VerifyProvidersWereUnchanged() []error {
+	if !c.buildActionsReady {
+		return []error{ErrBuildActionsNotReady}
+	}
+	var errors []error
+	for _, m := range c.modulesSorted {
+		for i, provider := range m.providers {
+			if provider != nil {
+				hash, err := proptools.HashProvider(provider)
+				if err != nil {
+					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set, and no longer hashable afterwards: %s", providerRegistry[i].typ, m.Name(), err.Error()))
+					continue
+				}
+				if provider != nil && m.providerInitialValueHashes[i] != hash {
+					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
+				}
+			} else if m.providerInitialValueHashes[i] != 0 {
+				// This should be unreachable, because in setProvider we check if the provider has already been set.
+				errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
+			}
+		}
+	}
+	return errors
+}
+
 // WriteBuildFile writes the Ninja manifest text for the generated build
 // actions to w.  If this is called before PrepareBuildActions successfully
 // completes then ErrBuildActionsNotReady is returned.
@@ -4276,7 +4434,7 @@ func (c *Context) writeBuildFileHeader(nw *ninjaWriter) error {
 
 	var pkgs []pkgAssociation
 	maxNameLen := 0
-	for pkg, name := range c.pkgNames {
+	for pkg, name := range c.nameTracker.pkgNames {
 		pkgs = append(pkgs, pkgAssociation{
 			PkgName: name,
 			PkgPath: pkg.pkgPath,
@@ -4329,7 +4487,7 @@ func (c *Context) writeSubninjas(nw *ninjaWriter) error {
 
 func (c *Context) writeBuildDir(nw *ninjaWriter) error {
 	if c.outDir != nil {
-		err := nw.Assign("builddir", c.outDir.Value(c.pkgNames))
+		err := nw.Assign("builddir", c.outDir.Value(c.nameTracker))
 		if err != nil {
 			return err
 		}
@@ -4340,29 +4498,6 @@ func (c *Context) writeBuildDir(nw *ninjaWriter) error {
 		}
 	}
 	return nil
-}
-
-type globalEntity interface {
-	fullName(pkgNames map[*packageContext]string) string
-}
-
-type globalEntitySorter struct {
-	pkgNames map[*packageContext]string
-	entities []globalEntity
-}
-
-func (s *globalEntitySorter) Len() int {
-	return len(s.entities)
-}
-
-func (s *globalEntitySorter) Less(i, j int) bool {
-	iName := s.entities[i].fullName(s.pkgNames)
-	jName := s.entities[j].fullName(s.pkgNames)
-	return iName < jName
-}
-
-func (s *globalEntitySorter) Swap(i, j int) {
-	s.entities[i], s.entities[j] = s.entities[j], s.entities[i]
 }
 
 func (c *Context) writeGlobalVariables(nw *ninjaWriter) error {
@@ -4383,7 +4518,7 @@ func (c *Context) writeGlobalVariables(nw *ninjaWriter) error {
 			}
 		}
 
-		err := nw.Assign(v.fullName(c.pkgNames), value.Value(c.pkgNames))
+		err := nw.Assign(c.nameTracker.Variable(v), value.Value(c.nameTracker))
 		if err != nil {
 			return err
 		}
@@ -4396,15 +4531,16 @@ func (c *Context) writeGlobalVariables(nw *ninjaWriter) error {
 		return nil
 	}
 
-	globalVariables := make([]globalEntity, 0, len(c.globalVariables))
+	globalVariables := make([]Variable, 0, len(c.globalVariables))
 	for variable := range c.globalVariables {
 		globalVariables = append(globalVariables, variable)
 	}
 
-	sort.Sort(&globalEntitySorter{c.pkgNames, globalVariables})
+	slices.SortFunc(globalVariables, func(a, b Variable) int {
+		return cmp.Compare(c.nameTracker.Variable(a), c.nameTracker.Variable(b))
+	})
 
-	for _, entity := range globalVariables {
-		v := entity.(Variable)
+	for _, v := range globalVariables {
 		if !visited[v] {
 			err := walk(v)
 			if err != nil {
@@ -4417,16 +4553,17 @@ func (c *Context) writeGlobalVariables(nw *ninjaWriter) error {
 }
 
 func (c *Context) writeGlobalPools(nw *ninjaWriter) error {
-	globalPools := make([]globalEntity, 0, len(c.globalPools))
+	globalPools := make([]Pool, 0, len(c.globalPools))
 	for pool := range c.globalPools {
 		globalPools = append(globalPools, pool)
 	}
 
-	sort.Sort(&globalEntitySorter{c.pkgNames, globalPools})
+	slices.SortFunc(globalPools, func(a, b Pool) int {
+		return cmp.Compare(c.nameTracker.Pool(a), c.nameTracker.Pool(b))
+	})
 
-	for _, entity := range globalPools {
-		pool := entity.(Pool)
-		name := pool.fullName(c.pkgNames)
+	for _, pool := range globalPools {
+		name := c.nameTracker.Pool(pool)
 		def := c.globalPools[pool]
 		err := def.WriteTo(nw, name)
 		if err != nil {
@@ -4443,18 +4580,19 @@ func (c *Context) writeGlobalPools(nw *ninjaWriter) error {
 }
 
 func (c *Context) writeGlobalRules(nw *ninjaWriter) error {
-	globalRules := make([]globalEntity, 0, len(c.globalRules))
+	globalRules := make([]Rule, 0, len(c.globalRules))
 	for rule := range c.globalRules {
 		globalRules = append(globalRules, rule)
 	}
 
-	sort.Sort(&globalEntitySorter{c.pkgNames, globalRules})
+	slices.SortFunc(globalRules, func(a, b Rule) int {
+		return cmp.Compare(c.nameTracker.Rule(a), c.nameTracker.Rule(b))
+	})
 
-	for _, entity := range globalRules {
-		rule := entity.(Rule)
-		name := rule.fullName(c.pkgNames)
+	for _, rule := range globalRules {
+		name := c.nameTracker.Rule(rule)
 		def := c.globalRules[rule]
-		err := def.WriteTo(nw, name, c.pkgNames)
+		err := def.WriteTo(nw, name, c.nameTracker)
 		if err != nil {
 			return err
 		}
@@ -4666,60 +4804,73 @@ func (c *Context) SetBeforePrepareBuildActionsHook(hookFn func() error) {
 // to be extracted as a phony output
 type phonyCandidate struct {
 	sync.Once
-	phony *buildDef // the phony buildDef that wraps the set
-	first *buildDef // the first buildDef that uses this set
+	phony            *buildDef      // the phony buildDef that wraps the set
+	first            *buildDef      // the first buildDef that uses this set
+	orderOnlyStrings []string       // the original OrderOnlyStrings of the first buildDef that uses this set
+	orderOnly        []*ninjaString // the original OrderOnly of the first buildDef that uses this set
 }
 
 // keyForPhonyCandidate gives a unique identifier for a set of deps.
 // If any of the deps use a variable, we return an empty string to signal
 // that this set of deps is ineligible for extraction.
-func keyForPhonyCandidate(deps []*ninjaString, stringDeps []string) string {
-	hasher := sha256.New()
+func keyForPhonyCandidate(deps []*ninjaString, stringDeps []string) uint64 {
+	hasher := fnv.New64a()
+	write := func(s string) {
+		// The hasher doesn't retain or modify the input slice, so pass the string data directly to avoid
+		// an extra allocation and copy.
+		_, err := hasher.Write(unsafe.Slice(unsafe.StringData(s), len(s)))
+		if err != nil {
+			panic(fmt.Errorf("write failed: %w", err))
+		}
+	}
 	for _, d := range deps {
 		if len(d.Variables()) != 0 {
-			return ""
+			return 0
 		}
-		io.WriteString(hasher, d.Value(nil))
+		write(d.Value(nil))
 	}
 	for _, d := range stringDeps {
-		io.WriteString(hasher, d)
+		write(d)
 	}
-	return base64.RawURLEncoding.EncodeToString(hasher.Sum(nil))
+	return hasher.Sum64()
 }
 
 // scanBuildDef is called for every known buildDef `b` that has a non-empty `b.OrderOnly`.
 // If `b.OrderOnly` is not present in `candidates`, it gets stored.
 // But if `b.OrderOnly` already exists in `candidates`, then `b.OrderOnly`
 // (and phonyCandidate#first.OrderOnly) will be replaced with phonyCandidate#phony.Outputs
-func scanBuildDef(wg *sync.WaitGroup, candidates *sync.Map, phonyCount *atomic.Uint32, b *buildDef) {
-	defer wg.Done()
+func scanBuildDef(candidates *sync.Map, b *buildDef) {
 	key := keyForPhonyCandidate(b.OrderOnly, b.OrderOnlyStrings)
-	if key == "" {
+	if key == 0 {
 		return
 	}
 	if v, loaded := candidates.LoadOrStore(key, &phonyCandidate{
-		first: b,
+		first:            b,
+		orderOnly:        b.OrderOnly,
+		orderOnlyStrings: b.OrderOnlyStrings,
 	}); loaded {
 		m := v.(*phonyCandidate)
-		m.Do(func() {
-			// this is the second occurrence and hence it makes sense to
-			// extract it as a phony output
-			phonyCount.Add(1)
-			m.phony = &buildDef{
-				Rule:          Phony,
-				OutputStrings: []string{"dedup-" + key},
-				Inputs:        m.first.OrderOnly, //we could also use b.OrderOnly
-				InputStrings:  m.first.OrderOnlyStrings,
-				Optional:      true,
-			}
-			// the previously recorded build-def, which first had these deps as its
-			// order-only deps, should now use this phony output instead
-			m.first.OrderOnlyStrings = m.phony.OutputStrings
-			m.first.OrderOnly = nil
-			m.first = nil
-		})
-		b.OrderOnlyStrings = m.phony.OutputStrings
-		b.OrderOnly = nil
+		if slices.EqualFunc(m.orderOnly, b.OrderOnly, ninjaStringsEqual) &&
+			slices.Equal(m.orderOnlyStrings, b.OrderOnlyStrings) {
+			m.Do(func() {
+				// this is the second occurrence and hence it makes sense to
+				// extract it as a phony output
+				m.phony = &buildDef{
+					Rule:          Phony,
+					OutputStrings: []string{fmt.Sprintf("dedup-%x", key)},
+					Inputs:        m.first.OrderOnly, //we could also use b.OrderOnly
+					InputStrings:  m.first.OrderOnlyStrings,
+					Optional:      true,
+				}
+				// the previously recorded build-def, which first had these deps as its
+				// order-only deps, should now use this phony output instead
+				m.first.OrderOnlyStrings = m.phony.OutputStrings
+				m.first.OrderOnly = nil
+				m.first = nil
+			})
+			b.OrderOnlyStrings = m.phony.OutputStrings
+			b.OrderOnly = nil
+		}
 	}
 }
 
@@ -4727,25 +4878,23 @@ func scanBuildDef(wg *sync.WaitGroup, candidates *sync.Map, phonyCount *atomic.U
 // buildDef instances in the provided moduleInfo instances. Each such
 // common set forms a new buildDef representing a phony output that then becomes
 // the sole order-only dependency of those buildDef instances
-func (c *Context) deduplicateOrderOnlyDeps(infos []*moduleInfo) *localBuildActions {
+func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildActions {
 	c.BeginEvent("deduplicate_order_only_deps")
 	defer c.EndEvent("deduplicate_order_only_deps")
 
 	candidates := sync.Map{} //used as map[key]*candidate
-	phonyCount := atomic.Uint32{}
-	wg := sync.WaitGroup{}
-	for _, info := range infos {
-		for _, b := range info.actionDefs.buildDefs {
-			if len(b.OrderOnly) > 0 || len(b.OrderOnlyStrings) > 0 {
-				wg.Add(1)
-				go scanBuildDef(&wg, &candidates, &phonyCount, b)
+	parallelVisit(modules, unorderedVisitorImpl{}, parallelVisitLimit,
+		func(m *moduleInfo, pause chan<- pauseSpec) bool {
+			for _, b := range m.actionDefs.buildDefs {
+				if len(b.OrderOnly) > 0 || len(b.OrderOnlyStrings) > 0 {
+					scanBuildDef(&candidates, b)
+				}
 			}
-		}
-	}
-	wg.Wait()
+			return false
+		})
 
 	// now collect all created phonys to return
-	phonys := make([]*buildDef, 0, phonyCount.Load())
+	var phonys []*buildDef
 	candidates.Range(func(_ any, v any) bool {
 		candidate := v.(*phonyCandidate)
 		if candidate.phony != nil {
@@ -4776,7 +4925,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 		if err != nil {
 			panic(err)
 		}
-		err = nw.Assign(name, value.Value(c.pkgNames))
+		err = nw.Assign(name, value.Value(c.nameTracker))
 		if err != nil {
 			return err
 		}
@@ -4799,7 +4948,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 			panic(err)
 		}
 
-		err = def.WriteTo(nw, name, c.pkgNames)
+		err = def.WriteTo(nw, name, c.nameTracker)
 		if err != nil {
 			return err
 		}
@@ -4812,7 +4961,7 @@ func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
 
 	// Write the build definitions.
 	for _, buildDef := range defs.buildDefs {
-		err := buildDef.WriteTo(nw, c.pkgNames)
+		err := buildDef.WriteTo(nw, c.nameTracker)
 		if err != nil {
 			return err
 		}
@@ -4876,6 +5025,260 @@ func funcName(f interface{}) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
 }
 
+// json representation of a dependency
+type depJson struct {
+	Name    string      `json:"name"`
+	Variant string      `json:"variant"`
+	TagType string      `json:"tag_type"`
+	TagData interface{} `json:"tag_data"`
+}
+
+// json representation of a provider
+type providerJson struct {
+	Type   string      `json:"type"`
+	Debug  string      `json:"debug"` // from GetDebugString on the provider data
+	Fields interface{} `json:"fields"`
+}
+
+// interface for getting debug info from various data.
+// TODO: Consider having this return a json object instead
+type Debuggable interface {
+	GetDebugString() string
+}
+
+// Convert a slice in a reflect.Value to a value suitable for outputting to json
+func debugSlice(value reflect.Value) interface{} {
+	size := value.Len()
+	if size == 0 {
+		return nil
+	}
+	result := make([]interface{}, size)
+	for i := 0; i < size; i++ {
+		result[i] = debugValue(value.Index(i))
+	}
+	return result
+}
+
+// Convert a map in a reflect.Value to a value suitable for outputting to json
+func debugMap(value reflect.Value) interface{} {
+	if value.IsNil() {
+		return nil
+	}
+	result := make(map[string]interface{})
+	iter := value.MapRange()
+	for iter.Next() {
+		// In the (hopefully) rare case of a key collision (which will happen when multiple
+		// go-typed keys have the same string representation, we'll just overwrite the last
+		// value.
+		result[debugKey(iter.Key())] = debugValue(iter.Value())
+	}
+	return result
+}
+
+// Convert a value into a string, suitable for being a json map key.
+func debugKey(value reflect.Value) string {
+	return fmt.Sprintf("%v", value)
+}
+
+// Convert a single value (possibly a map or slice too) in a reflect.Value to a value suitable for outputting to json
+func debugValue(value reflect.Value) interface{} {
+	// Remember if we originally received a reflect.Interface.
+	wasInterface := value.Kind() == reflect.Interface
+	// Dereference pointers down to the real type
+	for value.Kind() == reflect.Ptr || value.Kind() == reflect.Interface {
+		// If it's nil, return nil
+		if value.IsNil() {
+			return nil
+		}
+		value = value.Elem()
+	}
+
+	// Skip private fields, maybe other weird corner cases of go's bizarre type system.
+	if !value.CanInterface() {
+		return nil
+	}
+
+	switch kind := value.Kind(); kind {
+	case reflect.Bool, reflect.String, reflect.Int, reflect.Uint:
+		return value.Interface()
+	case reflect.Slice:
+		return debugSlice(value)
+	case reflect.Struct:
+		// If we originally received an interface, and there is a String() method, call that.
+		// TODO: figure out why Path doesn't work correctly otherwise (in aconfigPropagatingDeclarationsInfo)
+		if s, ok := value.Interface().(interface{ String() string }); wasInterface && ok {
+			return s.String()
+		}
+		return debugStruct(value)
+	case reflect.Map:
+		return debugMap(value)
+	default:
+		// TODO: add cases as we find them.
+		return fmt.Sprintf("debugValue(Kind=%v, wasInterface=%v)", kind, wasInterface)
+	}
+
+	return nil
+}
+
+// Convert an object in a reflect.Value to a value suitable for outputting to json
+func debugStruct(value reflect.Value) interface{} {
+	result := make(map[string]interface{})
+	debugStructAppend(value, &result)
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// Convert an object to a value suiable for outputting to json
+func debugStructAppend(value reflect.Value, result *map[string]interface{}) {
+	for value.Kind() == reflect.Ptr {
+		if value.IsNil() {
+			return
+		}
+		value = value.Elem()
+	}
+	if value.IsZero() {
+		return
+	}
+
+	if value.Kind() != reflect.Struct {
+		// TODO: could maybe support other types
+		return
+	}
+
+	structType := value.Type()
+	for i := 0; i < value.NumField(); i++ {
+		v := debugValue(value.Field(i))
+		if v != nil {
+			(*result)[structType.Field(i).Name] = v
+		}
+	}
+}
+
+func debugPropertyStruct(props interface{}, result *map[string]interface{}) {
+	if props == nil {
+		return
+	}
+	debugStructAppend(reflect.ValueOf(props), result)
+}
+
+// Get the debug json for a single module. Returns thae data as
+// flattened json text for easy concatenation by GenerateModuleDebugInfo.
+func getModuleDebugJson(module *moduleInfo) []byte {
+	info := struct {
+		Name       string                 `json:"name"`
+		SourceFile string                 `json:"source_file"`
+		SourceLine int                    `json:"source_line"`
+		Type       string                 `json:"type"`
+		Variant    string                 `json:"variant"`
+		Deps       []depJson              `json:"deps"`
+		Providers  []providerJson         `json:"providers"`
+		Debug      string                 `json:"debug"` // from GetDebugString on the module
+		Properties map[string]interface{} `json:"properties"`
+	}{
+		Name:       module.logicModule.Name(),
+		SourceFile: module.pos.Filename,
+		SourceLine: module.pos.Line,
+		Type:       module.typeName,
+		Variant:    module.variant.name,
+		Deps: func() []depJson {
+			result := make([]depJson, len(module.directDeps))
+			for i, dep := range module.directDeps {
+				result[i] = depJson{
+					Name:    dep.module.logicModule.Name(),
+					Variant: dep.module.variant.name,
+				}
+				t := reflect.TypeOf(dep.tag)
+				if t != nil {
+					result[i].TagType = t.PkgPath() + "." + t.Name()
+					result[i].TagData = debugStruct(reflect.ValueOf(dep.tag))
+				}
+			}
+			return result
+		}(),
+		Providers: func() []providerJson {
+			result := make([]providerJson, 0, len(module.providers))
+			for _, p := range module.providers {
+				pj := providerJson{}
+				include := false
+
+				t := reflect.TypeOf(p)
+				if t != nil {
+					pj.Type = t.PkgPath() + "." + t.Name()
+					include = true
+				}
+
+				if dbg, ok := p.(Debuggable); ok {
+					pj.Debug = dbg.GetDebugString()
+					if pj.Debug != "" {
+						include = true
+					}
+				}
+
+				if p != nil {
+					pj.Fields = debugValue(reflect.ValueOf(p))
+					include = true
+				}
+
+				if include {
+					result = append(result, pj)
+				}
+			}
+			return result
+		}(),
+		Debug: func() string {
+			if dbg, ok := module.logicModule.(Debuggable); ok {
+				return dbg.GetDebugString()
+			} else {
+				return ""
+			}
+		}(),
+		Properties: func() map[string]interface{} {
+			result := make(map[string]interface{})
+			for _, props := range module.properties {
+				debugPropertyStruct(props, &result)
+			}
+			return result
+		}(),
+	}
+	buf, _ := json.Marshal(info)
+	return buf
+}
+
+// Generate out/soong/soong-debug-info.json Called if GENERATE_SOONG_DEBUG=true.
+func (this *Context) GenerateModuleDebugInfo(filename string) {
+	err := os.MkdirAll(filepath.Dir(filename), 0777)
+	if err != nil {
+		// We expect this to be writable
+		panic(fmt.Sprintf("couldn't create directory for soong module debug file %s: %s", filepath.Dir(filename), err))
+	}
+
+	f, err := os.Create(filename)
+	if err != nil {
+		// We expect this to be writable
+		panic(fmt.Sprintf("couldn't create soong module debug file %s: %s", filename, err))
+	}
+	defer f.Close()
+
+	needComma := false
+	f.WriteString("{\n\"modules\": [\n")
+
+	// TODO: Optimize this (parallel execution, etc) if it gets slow.
+	this.visitAllModuleInfos(func(module *moduleInfo) {
+		if needComma {
+			f.WriteString(",\n")
+		} else {
+			needComma = true
+		}
+
+		moduleData := getModuleDebugJson(module)
+		f.Write(moduleData)
+	})
+
+	f.WriteString("\n]\n}")
+}
+
 var fileHeaderTemplate = `******************************************************************************
 ***            This file is generated and should not be edited             ***
 ******************************************************************************
@@ -4934,14 +5337,14 @@ func (pi *PackageIncludes) MatchAll() []string {
 }
 
 // Returns true if all requested include tags are set in the Context object
-func (pi *PackageIncludes) MatchesIncludeTags(ctx *Context) bool {
+func (pi *PackageIncludes) matchesIncludeTags(ctx *Context) (bool, error) {
 	if len(pi.MatchAll()) == 0 {
-		ctx.ModuleErrorf(pi, "Match_all must be a non-empty list")
+		return false, ctx.ModuleErrorf(pi, "Match_all must be a non-empty list")
 	}
 	for _, includeTag := range pi.MatchAll() {
 		if !ctx.ContainsIncludeTag(includeTag) {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
