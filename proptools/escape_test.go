@@ -15,8 +15,10 @@
 package proptools
 
 import (
+	"bytes"
 	"os/exec"
 	"reflect"
+	"slices"
 	"testing"
 	"unsafe"
 )
@@ -143,8 +145,9 @@ func TestExternalShellEscaping(t *testing.T) {
 		return
 	}
 	for _, testCase := range shellEscapeTestCase {
-		cmd := "echo -n " + ShellEscape(testCase.in)
+		cmd := "echo " + ShellEscape(testCase.in)
 		got, err := exec.Command("/bin/sh", "-c", cmd).Output()
+		got = bytes.TrimSuffix(got, []byte("\n"))
 		if err != nil {
 			t.Error(err)
 		}
@@ -159,8 +162,9 @@ func TestExternalShellEscapeIncludingSpaces(t *testing.T) {
 		return
 	}
 	for _, testCase := range shellEscapeIncludingSpacesTestCase {
-		cmd := "echo -n " + ShellEscapeIncludingSpaces(testCase.in)
+		cmd := "echo " + ShellEscapeIncludingSpaces(testCase.in)
 		got, err := exec.Command("/bin/sh", "-c", cmd).Output()
+		got = bytes.TrimSuffix(got, []byte("\n"))
 		if err != nil {
 			t.Error(err)
 		}
@@ -232,7 +236,7 @@ func TestNinjaEscapeList(t *testing.T) {
 		t.Run(tf.name, func(t *testing.T) {
 			for _, tt := range testCases {
 				t.Run(tt.name, func(t *testing.T) {
-					inCopy := append([]string(nil), tt.in...)
+					inCopy := slices.Clone(tt.in)
 
 					got := tf.f(tt.in)
 

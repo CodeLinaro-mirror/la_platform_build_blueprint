@@ -20,6 +20,7 @@ import (
 )
 
 var validPrinterTestCases = []struct {
+	name   string
 	input  string
 	output string
 }{
@@ -280,7 +281,6 @@ module // test
 		output: `
 // test
 module { // test
-
     srcs: [
         "src1.c",
         "src2.c",
@@ -355,9 +355,7 @@ test // test
 `,
 		output: `
 test { // test
-
 // test
-
 }
 `,
 	},
@@ -559,37 +557,186 @@ foo {
 }
 `,
 	},
+	{
+		name: "Basic selects",
+		input: `
+// test
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "a": "a2",
+        // test2
+        "b": "b2",
+        // test3
+        default: "c2",
+    }),
+}
+`,
+		output: `
+// test
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "a": "a2",
+        // test2
+        "b": "b2",
+        // test3
+        default: "c2",
+    }),
+}
+`,
+	},
+	{
+		name: "Remove select with only default",
+		input: `
+// test
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        // test2
+        default: "c2",
+    }),
+}
+`,
+		output: `
+// test
+foo {
+    stuff: "c2", // test2
+}
+`,
+	},
+	{
+		name: "Appended selects",
+		input: `
+// test
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "a": "a2",
+        // test2
+        "b": "b2",
+        // test3
+        default: "c2",
+    }) + select(release_variable("RELEASE_TEST"), {
+        "d": "d2",
+        "e": "e2",
+        default: "f2",
+    }),
+}
+`,
+		output: `
+// test
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "a": "a2",
+        // test2
+        "b": "b2",
+        // test3
+        default: "c2",
+    }) + select(release_variable("RELEASE_TEST"), {
+        "d": "d2",
+        "e": "e2",
+        default: "f2",
+    }),
+}
+`,
+	},
+	{
+		name: "Select with unset property",
+		input: `
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "foo": unset,
+        default: "c2",
+    }),
+}
+`,
+		output: `
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "foo": unset,
+        default: "c2",
+    }),
+}
+`,
+	},
+	{
+		name: "Select with only unsets is removed",
+		input: `
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "foo": unset,
+        default: unset,
+    }),
+}
+`,
+		output: `
+foo {
+
+}
+`,
+	},
+	{
+		name: "Additions of unset selects are removed",
+		input: `
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "foo": "a",
+        default: "b",
+    }) + select(soong_config_variable("my_namespace", "my_variable2"), {
+        "foo": unset,
+        default: unset,
+    }) + select(soong_config_variable("my_namespace", "my_variable3"), {
+        "foo": "c",
+        default: "d",
+    }),
+}
+`,
+		// TODO(b/323382414): This is not good formatting, revisit later.
+		// But at least it removes the useless middle select
+		output: `
+foo {
+    stuff: select(soong_config_variable("my_namespace", "my_variable"), {
+        "foo": "a",
+        default: "b",
+    }) +
+
+        select(soong_config_variable("my_namespace", "my_variable3"), {
+            "foo": "c",
+            default: "d",
+        }),
+}
+`,
+	},
 }
 
 func TestPrinter(t *testing.T) {
 	for _, testCase := range validPrinterTestCases {
-		in := testCase.input[1:]
-		expected := testCase.output[1:]
+		t.Run(testCase.name, func(t *testing.T) {
+			in := testCase.input[1:]
+			expected := testCase.output[1:]
 
-		r := bytes.NewBufferString(in)
-		file, errs := Parse("", r, NewScope(nil))
-		if len(errs) != 0 {
-			t.Errorf("test case: %s", in)
-			t.Errorf("unexpected errors:")
-			for _, err := range errs {
-				t.Errorf("  %s", err)
+			r := bytes.NewBufferString(in)
+			file, errs := Parse("", r, NewScope(nil))
+			if len(errs) != 0 {
+				t.Errorf("test case: %s", in)
+				t.Errorf("unexpected errors:")
+				for _, err := range errs {
+					t.Errorf("  %s", err)
+				}
+				t.FailNow()
 			}
-			t.FailNow()
-		}
 
-		SortLists(file)
+			SortLists(file)
 
-		got, err := Print(file)
-		if err != nil {
-			t.Errorf("test case: %s", in)
-			t.Errorf("unexpected error: %s", err)
-			t.FailNow()
-		}
+			got, err := Print(file)
+			if err != nil {
+				t.Errorf("test case: %s", in)
+				t.Errorf("unexpected error: %s", err)
+				t.FailNow()
+			}
 
-		if string(got) != expected {
-			t.Errorf("test case: %s", in)
-			t.Errorf("  expected: %s", expected)
-			t.Errorf("       got: %s", string(got))
-		}
+			if string(got) != expected {
+				t.Errorf("test case: %s", in)
+				t.Errorf("  expected: %s", expected)
+				t.Errorf("       got: %s", string(got))
+			}
+		})
 	}
 }

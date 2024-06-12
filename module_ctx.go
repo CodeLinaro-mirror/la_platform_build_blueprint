@@ -166,6 +166,9 @@ type EarlyModuleContext interface {
 	// PropertyErrorf reports an error at the line number of a property in the module definition.
 	PropertyErrorf(property, fmt string, args ...interface{})
 
+	// OtherModulePropertyErrorf reports an error at the line number of a property in the given module definition.
+	OtherModulePropertyErrorf(logicModule Module, property string, format string, args ...interface{})
+
 	// Failed returns true if any errors have been reported.  In most cases the module can continue with generating
 	// build rules after an error, allowing it to report additional errors in a single run, but in cases where the error
 	// has prevented the module from creating necessary data it can return early when Failed returns true.
@@ -334,31 +337,31 @@ type BaseModuleContext interface {
 	OtherModuleReverseDependencyVariantExists(name string) bool
 
 	// OtherModuleProvider returns the value for a provider for the given module.  If the value is
-	// not set it returns the zero value of the type of the provider, so the return value can always
-	// be type asserted to the type of the provider.  The value returned may be a deep copy of the
-	// value originally passed to SetProvider.
-	OtherModuleProvider(m Module, provider ProviderKey) interface{}
-
-	// OtherModuleHasProvider returns true if the provider for the given module has been set.
-	OtherModuleHasProvider(m Module, provider ProviderKey) bool
+	// not set it returns nil and false.  The value returned may be a deep copy of the value originally
+	// passed to SetProvider.
+	//
+	// This method shouldn't be used directly, prefer the type-safe android.OtherModuleProvider instead.
+	OtherModuleProvider(m Module, provider AnyProviderKey) (any, bool)
 
 	// Provider returns the value for a provider for the current module.  If the value is
-	// not set it returns the zero value of the type of the provider, so the return value can always
-	// be type asserted to the type of the provider.  It panics if called before the appropriate
+	// not set it returns nil and false.  It panics if called before the appropriate
 	// mutator or GenerateBuildActions pass for the provider.  The value returned may be a deep
 	// copy of the value originally passed to SetProvider.
-	Provider(provider ProviderKey) interface{}
-
-	// HasProvider returns true if the provider for the current module has been set.
-	HasProvider(provider ProviderKey) bool
+	//
+	// This method shouldn't be used directly, prefer the type-safe android.ModuleProvider instead.
+	Provider(provider AnyProviderKey) (any, bool)
 
 	// SetProvider sets the value for a provider for the current module.  It panics if not called
 	// during the appropriate mutator or GenerateBuildActions pass for the provider, if the value
 	// is not of the appropriate type, or if the value has already been set.  The value should not
 	// be modified after being passed to SetProvider.
-	SetProvider(provider ProviderKey, value interface{})
+	//
+	// This method shouldn't be used directly, prefer the type-safe android.SetProvider instead.
+	SetProvider(provider AnyProviderKey, value any)
 
 	EarlyGetMissingDependencies() []string
+
+	base() *baseModuleContext
 }
 
 type DynamicDependerModuleContext BottomUpMutatorContext
@@ -456,34 +459,19 @@ func (d *baseModuleContext) Errorf(pos scanner.Position,
 func (d *baseModuleContext) ModuleErrorf(format string,
 	args ...interface{}) {
 
-	d.error(&ModuleError{
-		BlueprintError: BlueprintError{
-			Err: fmt.Errorf(format, args...),
-			Pos: d.module.pos,
-		},
-		module: d.module,
-	})
+	d.error(d.context.ModuleErrorf(d.module.logicModule, format, args...))
 }
 
 func (d *baseModuleContext) PropertyErrorf(property, format string,
 	args ...interface{}) {
 
-	pos := d.module.propertyPos[property]
+	d.error(d.context.PropertyErrorf(d.module.logicModule, property, format, args...))
+}
 
-	if !pos.IsValid() {
-		pos = d.module.pos
-	}
+func (d *baseModuleContext) OtherModulePropertyErrorf(logicModule Module, property string, format string,
+	args ...interface{}) {
 
-	d.error(&PropertyError{
-		ModuleError: ModuleError{
-			BlueprintError: BlueprintError{
-				Err: fmt.Errorf(format, args...),
-				Pos: pos,
-			},
-			module: d.module,
-		},
-		property: property,
-	})
+	d.error(d.context.PropertyErrorf(logicModule, property, format, args...))
 }
 
 func (d *baseModuleContext) Failed() bool {
@@ -609,30 +597,17 @@ func (m *baseModuleContext) OtherModuleReverseDependencyVariantExists(name strin
 	return found != nil
 }
 
-func (m *baseModuleContext) OtherModuleProvider(logicModule Module, provider ProviderKey) interface{} {
+func (m *baseModuleContext) OtherModuleProvider(logicModule Module, provider AnyProviderKey) (any, bool) {
 	module := m.context.moduleInfo[logicModule]
-	value, _ := m.context.provider(module, provider)
-	return value
+	return m.context.provider(module, provider.provider())
 }
 
-func (m *baseModuleContext) OtherModuleHasProvider(logicModule Module, provider ProviderKey) bool {
-	module := m.context.moduleInfo[logicModule]
-	_, ok := m.context.provider(module, provider)
-	return ok
+func (m *baseModuleContext) Provider(provider AnyProviderKey) (any, bool) {
+	return m.context.provider(m.module, provider.provider())
 }
 
-func (m *baseModuleContext) Provider(provider ProviderKey) interface{} {
-	value, _ := m.context.provider(m.module, provider)
-	return value
-}
-
-func (m *baseModuleContext) HasProvider(provider ProviderKey) bool {
-	_, ok := m.context.provider(m.module, provider)
-	return ok
-}
-
-func (m *baseModuleContext) SetProvider(provider ProviderKey, value interface{}) {
-	m.context.setProvider(m.module, provider, value)
+func (m *baseModuleContext) SetProvider(provider AnyProviderKey, value interface{}) {
+	m.context.setProvider(m.module, provider.provider(), value)
 }
 
 func (m *baseModuleContext) GetDirectDep(name string) (Module, DependencyTag) {
@@ -778,6 +753,10 @@ func (m *baseModuleContext) ModuleFactories() map[string]ModuleFactory {
 	return ret
 }
 
+func (m *baseModuleContext) base() *baseModuleContext {
+	return m
+}
+
 func (m *moduleContext) ModuleSubDir() string {
 	return m.module.variant.name
 }
@@ -834,7 +813,7 @@ func (m *baseModuleContext) EarlyGetMissingDependencies() []string {
 
 type mutatorContext struct {
 	baseModuleContext
-	name             string
+	mutator          *mutatorInfo
 	reverseDeps      []reverseDep
 	rename           []rename
 	replace          []replace
@@ -979,7 +958,7 @@ type BottomUpMutatorContext interface {
 	// if the value is not of the appropriate type, or if the module is not a newly created
 	// variant of the current module.  The value should not be modified after being passed to
 	// SetVariationProvider.
-	SetVariationProvider(module Module, provider ProviderKey, value interface{})
+	SetVariationProvider(module Module, provider AnyProviderKey, value interface{})
 }
 
 // A Mutator function is called for each Module, and can use
@@ -1011,27 +990,27 @@ func (BaseDependencyTag) dependencyTag(DependencyTag) {
 var _ DependencyTag = BaseDependencyTag{}
 
 func (mctx *mutatorContext) MutatorName() string {
-	return mctx.name
+	return mctx.mutator.name
 }
 
 func (mctx *mutatorContext) CreateVariations(variationNames ...string) []Module {
-	depChooser := chooseDepInherit(mctx.name, mctx.defaultVariation)
+	depChooser := chooseDepInherit(mctx.mutator.name, mctx.defaultVariation)
 	return mctx.createVariations(variationNames, depChooser, false)
 }
 
-func (mctx *mutatorContext) createVariationsWithTransition(transition Transition, variationNames ...string) []Module {
-	return mctx.createVariations(variationNames, chooseDepByTransition(mctx.name, transition), false)
+func (mctx *mutatorContext) createVariationsWithTransition(variationNames []string, outgoingTransitions [][]string) []Module {
+	return mctx.createVariations(variationNames, chooseDepByIndexes(mctx.mutator.name, outgoingTransitions), false)
 }
 
 func (mctx *mutatorContext) CreateLocalVariations(variationNames ...string) []Module {
-	depChooser := chooseDepInherit(mctx.name, mctx.defaultVariation)
+	depChooser := chooseDepInherit(mctx.mutator.name, mctx.defaultVariation)
 	return mctx.createVariations(variationNames, depChooser, true)
 }
 
-func (mctx *mutatorContext) SetVariationProvider(module Module, provider ProviderKey, value interface{}) {
+func (mctx *mutatorContext) SetVariationProvider(module Module, provider AnyProviderKey, value interface{}) {
 	for _, variant := range mctx.newVariations {
 		if m := variant.module(); m != nil && m.logicModule == module {
-			mctx.context.setProvider(m, provider, value)
+			mctx.context.setProvider(m, provider.provider(), value)
 			return
 		}
 	}
@@ -1040,7 +1019,7 @@ func (mctx *mutatorContext) SetVariationProvider(module Module, provider Provide
 
 func (mctx *mutatorContext) createVariations(variationNames []string, depChooser depChooser, local bool) []Module {
 	var ret []Module
-	modules, errs := mctx.context.createVariations(mctx.module, mctx.name, depChooser, variationNames, local)
+	modules, errs := mctx.context.createVariations(mctx.module, mctx.mutator, depChooser, variationNames, local)
 	if len(errs) > 0 {
 		mctx.errs = append(mctx.errs, errs...)
 	}
@@ -1071,7 +1050,7 @@ func (mctx *mutatorContext) AliasVariation(variationName string) {
 	}
 
 	for _, variant := range mctx.newVariations {
-		if variant.moduleOrAliasVariant().variations[mctx.name] == variationName {
+		if variant.moduleOrAliasVariant().variations[mctx.mutator.name] == variationName {
 			alias := &moduleAlias{
 				variant: mctx.module.variant,
 				target:  variant.moduleOrAliasTarget(),
@@ -1085,13 +1064,13 @@ func (mctx *mutatorContext) AliasVariation(variationName string) {
 
 	var foundVariations []string
 	for _, variant := range mctx.newVariations {
-		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.name])
+		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.mutator.name])
 	}
 	panic(fmt.Errorf("no %q variation in module variations %q", variationName, foundVariations))
 }
 
 func (mctx *mutatorContext) CreateAliasVariation(aliasVariationName, targetVariationName string) {
-	newVariant := newVariant(mctx.module, mctx.name, aliasVariationName, false)
+	newVariant := newVariant(mctx.module, mctx.mutator.name, aliasVariationName, false)
 
 	for _, moduleOrAlias := range mctx.module.splitModules {
 		if moduleOrAlias.moduleOrAliasVariant().variations.equal(newVariant.variations) {
@@ -1104,7 +1083,7 @@ func (mctx *mutatorContext) CreateAliasVariation(aliasVariationName, targetVaria
 	}
 
 	for _, variant := range mctx.newVariations {
-		if variant.moduleOrAliasVariant().variations[mctx.name] == targetVariationName {
+		if variant.moduleOrAliasVariant().variations[mctx.mutator.name] == targetVariationName {
 			// Append the alias here so that it comes after any aliases created by AliasVariation.
 			mctx.module.splitModules = append(mctx.module.splitModules, &moduleAlias{
 				variant: newVariant,
@@ -1116,18 +1095,14 @@ func (mctx *mutatorContext) CreateAliasVariation(aliasVariationName, targetVaria
 
 	var foundVariations []string
 	for _, variant := range mctx.newVariations {
-		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.name])
+		foundVariations = append(foundVariations, variant.moduleOrAliasVariant().variations[mctx.mutator.name])
 	}
 	panic(fmt.Errorf("no %q variation in module variations %q", targetVariationName, foundVariations))
 }
 
-func (mctx *mutatorContext) applyTransition(transition Transition) {
-	mctx.context.convertDepsToVariation(mctx.module, chooseDepByTransition(mctx.name, transition))
-}
-
 func (mctx *mutatorContext) SetDependencyVariation(variationName string) {
-	mctx.context.convertDepsToVariation(mctx.module, chooseDepExplicit(
-		mctx.name, variationName, nil))
+	mctx.context.convertDepsToVariation(mctx.module, 0, chooseDepExplicit(
+		mctx.mutator.name, variationName, nil))
 }
 
 func (mctx *mutatorContext) SetDefaultDependencyVariation(variationName *string) {

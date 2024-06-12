@@ -214,6 +214,14 @@ func (p *parser) parseDefinitions() (defs []Definition) {
 func (p *parser) parseAssignment(name string, namePos scanner.Position,
 	assigner string) (assignment *Assignment) {
 
+	// These are used as keywords in select statements, prevent making variables
+	// with the same name to avoid any confusion.
+	switch name {
+	case "default", "unset":
+		p.errorf("'default' and 'unset' are reserved keywords, and cannot be used as variable names")
+		return nil
+	}
+
 	assignment = new(Assignment)
 
 	pos := p.scanner.Position
@@ -289,7 +297,12 @@ func (p *parser) parseModule(typ string, typPos scanner.Position) *Module {
 func (p *parser) parsePropertyList(isModule, compat bool) (properties []*Property) {
 	for p.tok == scanner.Ident {
 		property := p.parseProperty(isModule, compat)
-		properties = append(properties, property)
+
+		// If a property is set to an empty select or a select where all branches are "unset",
+		// skip emitting the property entirely.
+		if property.Value.Type() != UnsetType {
+			properties = append(properties, property)
+		}
 
 		if p.tok != ',' {
 			// There was no comma, so the list is done.
@@ -350,7 +363,14 @@ func (p *parser) parseExpression() (value Expression) {
 }
 
 func (p *parser) evaluateOperator(value1, value2 Expression, operator rune,
-	pos scanner.Position) (*Operator, error) {
+	pos scanner.Position) (Expression, error) {
+
+	if value1.Type() == UnsetType {
+		return value2, nil
+	}
+	if value2.Type() == UnsetType {
+		return value1, nil
+	}
 
 	value := value1
 
@@ -360,6 +380,21 @@ func (p *parser) evaluateOperator(value1, value2 Expression, operator rune,
 		if e1.Type() != e2.Type() {
 			return nil, fmt.Errorf("mismatched type in operator %c: %s != %s", operator,
 				e1.Type(), e2.Type())
+		}
+
+		if _, ok := e1.(*Select); !ok {
+			if _, ok := e2.(*Select); ok {
+				// Promote e1 to a select so we can add e2 to it
+				e1 = &Select{
+					Typ: SelectTypeUnconfigured,
+					Cases: []*SelectCase{{
+						Pattern: String{
+							Value: "__soong_conditions_default__",
+						},
+						Value: e1,
+					}},
+				}
+			}
 		}
 
 		value = e1.Copy()
@@ -380,6 +415,8 @@ func (p *parser) evaluateOperator(value1, value2 Expression, operator rune,
 				if err != nil {
 					return nil, err
 				}
+			case *Select:
+				v.Append = e2
 			default:
 				return nil, fmt.Errorf("operator %c not supported on type %s", operator, v.Type())
 			}
@@ -437,7 +474,7 @@ func (p *parser) addMaps(map1, map2 []*Property, pos scanner.Position) ([]*Prope
 	return ret, nil
 }
 
-func (p *parser) parseOperator(value1 Expression) *Operator {
+func (p *parser) parseOperator(value1 Expression) Expression {
 	operator := p.tok
 	pos := p.scanner.Position
 	p.accept(operator)
@@ -457,7 +494,14 @@ func (p *parser) parseOperator(value1 Expression) *Operator {
 func (p *parser) parseValue() (value Expression) {
 	switch p.tok {
 	case scanner.Ident:
-		return p.parseVariable()
+		switch text := p.scanner.TokenText(); text {
+		case "true", "false":
+			return p.parseBoolean()
+		case "select":
+			return p.parseSelect()
+		default:
+			return p.parseVariable()
+		}
 	case '-', scanner.Int: // Integer might have '-' sign ahead ('+' is only treated as operator now)
 		return p.parseIntValue()
 	case scanner.String, scanner.RawString:
@@ -473,38 +517,193 @@ func (p *parser) parseValue() (value Expression) {
 	}
 }
 
-func (p *parser) parseVariable() Expression {
-	var value Expression
-
+func (p *parser) parseBoolean() Expression {
 	switch text := p.scanner.TokenText(); text {
 	case "true", "false":
-		value = &Bool{
+		result := &Bool{
 			LiteralPos: p.scanner.Position,
 			Value:      text == "true",
 			Token:      text,
 		}
+		p.accept(scanner.Ident)
+		return result
 	default:
-		if p.eval {
-			if assignment, local := p.scope.Get(text); assignment == nil {
-				p.errorf("variable %q is not set", text)
-			} else {
-				if local {
-					assignment.Referenced = true
-				}
-				value = assignment.Value
-			}
+		p.errorf("Expected true/false, got %q", text)
+		return nil
+	}
+}
+
+func (p *parser) parseVariable() Expression {
+	var value Expression
+
+	text := p.scanner.TokenText()
+	if p.eval {
+		if assignment, local := p.scope.Get(text); assignment == nil {
+			p.errorf("variable %q is not set", text)
 		} else {
-			value = &NotEvaluated{}
+			if local {
+				assignment.Referenced = true
+			}
+			value = assignment.Value
 		}
-		value = &Variable{
-			Name:    text,
-			NamePos: p.scanner.Position,
-			Value:   value,
-		}
+	} else {
+		value = &NotEvaluated{}
+	}
+	value = &Variable{
+		Name:    text,
+		NamePos: p.scanner.Position,
+		Value:   value,
 	}
 
 	p.accept(scanner.Ident)
 	return value
+}
+
+func (p *parser) parseSelect() Expression {
+	result := &Select{
+		KeywordPos: p.scanner.Position,
+	}
+	p.accept(scanner.Ident)
+	if !p.accept('(') {
+		return nil
+	}
+	switch p.scanner.TokenText() {
+	case "release_variable":
+		result.Typ = SelectTypeReleaseVariable
+	case "soong_config_variable":
+		result.Typ = SelectTypeSoongConfigVariable
+	case "product_variable":
+		result.Typ = SelectTypeProductVariable
+	case "variant":
+		result.Typ = SelectTypeVariant
+	default:
+		p.errorf("unknown select type %q, expected release_variable, soong_config_variable, product_variable, or variant", p.scanner.TokenText())
+		return nil
+	}
+	p.accept(scanner.Ident)
+	if !p.accept('(') {
+		return nil
+	}
+
+	if s := p.parseStringValue(); s != nil {
+		result.Condition = *s
+	} else {
+		return nil
+	}
+
+	if result.Typ == SelectTypeSoongConfigVariable {
+		if !p.accept(',') {
+			return nil
+		}
+		if s := p.parseStringValue(); s != nil {
+			result.Condition.Value += ":" + s.Value
+		} else {
+			return nil
+		}
+	}
+
+	if !p.accept(')') {
+		return nil
+	}
+
+	if !p.accept(',') {
+		return nil
+	}
+
+	result.LBracePos = p.scanner.Position
+	if !p.accept('{') {
+		return nil
+	}
+
+	hasNonUnsetValue := false
+	for p.tok == scanner.String {
+		c := &SelectCase{}
+		if s := p.parseStringValue(); s != nil {
+			if strings.HasPrefix(s.Value, "__soong") {
+				p.errorf("select branch conditions starting with __soong are reserved for internal use")
+				return nil
+			}
+			c.Pattern = *s
+		} else {
+			return nil
+		}
+		c.ColonPos = p.scanner.Position
+		if !p.accept(':') {
+			return nil
+		}
+		if p.tok == scanner.Ident && p.scanner.TokenText() == "unset" {
+			c.Value = UnsetProperty{Position: p.scanner.Position}
+			p.accept(scanner.Ident)
+		} else {
+			hasNonUnsetValue = true
+			c.Value = p.parseExpression()
+		}
+		if !p.accept(',') {
+			return nil
+		}
+
+		result.Cases = append(result.Cases, c)
+	}
+
+	// Default must be last
+	if p.tok == scanner.Ident {
+		if p.scanner.TokenText() != "default" {
+			p.errorf("select cases can either be quoted strings or 'default' to match any value")
+			return nil
+		}
+		c := &SelectCase{Pattern: String{
+			LiteralPos: p.scanner.Position,
+			Value:      "__soong_conditions_default__",
+		}}
+		p.accept(scanner.Ident)
+		c.ColonPos = p.scanner.Position
+		if !p.accept(':') {
+			return nil
+		}
+		if p.tok == scanner.Ident && p.scanner.TokenText() == "unset" {
+			c.Value = UnsetProperty{Position: p.scanner.Position}
+			p.accept(scanner.Ident)
+		} else {
+			hasNonUnsetValue = true
+			c.Value = p.parseExpression()
+		}
+		if !p.accept(',') {
+			return nil
+		}
+		result.Cases = append(result.Cases, c)
+	}
+
+	// If all branches have the value "unset", then this is equivalent
+	// to an empty select.
+	if !hasNonUnsetValue {
+		result.Typ = SelectTypeUnconfigured
+		result.Condition.Value = ""
+		result.Cases = nil
+	}
+
+	ty := UnsetType
+	for _, c := range result.Cases {
+		otherTy := c.Value.Type()
+		// Any other type can override UnsetType
+		if ty == UnsetType {
+			ty = otherTy
+		}
+		if otherTy != UnsetType && otherTy != ty {
+			p.errorf("Found select statement with differing types %q and %q in its cases", ty.String(), otherTy.String())
+			return nil
+		}
+	}
+
+	result.ExpressionType = ty
+
+	result.RBracePos = p.scanner.Position
+	if !p.accept('}') {
+		return nil
+	}
+	if !p.accept(')') {
+		return nil
+	}
+	return result
 }
 
 func (p *parser) parseStringValue() *String {

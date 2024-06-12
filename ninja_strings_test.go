@@ -16,6 +16,7 @@ package blueprint
 
 import (
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -164,7 +165,7 @@ func TestParseNinjaString(t *testing.T) {
 
 			output, err := parseNinjaString(scope, testCase.input)
 			if err == nil {
-				if g, w := output.Value(nil), testCase.value; g != w {
+				if g, w := output.Value(&nameTracker{}), testCase.value; g != w {
 					t.Errorf("incorrect Value output, want %q, got %q", w, g)
 				}
 
@@ -191,7 +192,11 @@ func TestParseNinjaString(t *testing.T) {
 }
 
 func TestParseNinjaStringWithImportedVar(t *testing.T) {
-	ImpVar := &staticVariable{name_: "ImpVar", fullName_: "g.impPkg.ImpVar"}
+	pctx := &packageContext{}
+	pkgNames := map[*packageContext]string{
+		pctx: "impPkg",
+	}
+	ImpVar := &staticVariable{pctx: pctx, name_: "ImpVar"}
 	impScope := newScope(nil)
 	impScope.AddVariable(ImpVar)
 	scope := newScope(nil)
@@ -211,7 +216,7 @@ func TestParseNinjaStringWithImportedVar(t *testing.T) {
 		t.Errorf("       got: %#v", *output.variables)
 	}
 
-	if g, w := output.Value(nil), "abc def ${g.impPkg.ImpVar} ghi"; g != w {
+	if g, w := output.Value(&nameTracker{pkgNames: pkgNames}), "abc def ${g.impPkg.ImpVar} ghi"; g != w {
 		t.Errorf("incorrect Value output, want %q got %q", w, g)
 	}
 }
@@ -267,7 +272,7 @@ func Test_parseNinjaOrSimpleStrings(t *testing.T) {
 
 	for _, tt := range testCases {
 		t.Run(tt.name, func(t *testing.T) {
-			inCopy := append([]string(nil), tt.in...)
+			inCopy := slices.Clone(tt.in)
 
 			scope := newLocalScope(nil, "")
 			scope.AddLocalVariable("abc", "abc")
@@ -289,7 +294,7 @@ func Test_parseNinjaOrSimpleStrings(t *testing.T) {
 			if gotNinjaStrings != nil {
 				evaluatedNinjaStrings = make([]string, 0, len(gotNinjaStrings))
 				for _, ns := range gotNinjaStrings {
-					evaluatedNinjaStrings = append(evaluatedNinjaStrings, ns.Value(nil))
+					evaluatedNinjaStrings = append(evaluatedNinjaStrings, ns.Value(&nameTracker{}))
 				}
 			}
 
@@ -364,7 +369,7 @@ func BenchmarkNinjaString_Value(b *testing.B) {
 			b.Run(strconv.Itoa(l), func(b *testing.B) {
 				b.ReportAllocs()
 				for n := 0; n < b.N; n++ {
-					ns.Value(nil)
+					ns.Value(&nameTracker{})
 				}
 			})
 		}
@@ -377,7 +382,7 @@ func BenchmarkNinjaString_Value(b *testing.B) {
 			b.Run(strconv.Itoa(l), func(b *testing.B) {
 				b.ReportAllocs()
 				for n := 0; n < b.N; n++ {
-					ns.Value(nil)
+					ns.Value(&nameTracker{})
 				}
 			})
 		}
@@ -394,7 +399,7 @@ func BenchmarkNinjaString_Value(b *testing.B) {
 			b.Run(strconv.Itoa(l), func(b *testing.B) {
 				b.ReportAllocs()
 				for n := 0; n < b.N; n++ {
-					ns.Value(nil)
+					ns.Value(&nameTracker{})
 				}
 			})
 		}
