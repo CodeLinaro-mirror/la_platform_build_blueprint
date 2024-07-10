@@ -575,7 +575,7 @@ func (m *baseModuleContext) OtherModuleDependencyVariantExists(variations []Vari
 	if possibleDeps == nil {
 		return false
 	}
-	found, _ := findVariant(m.module, possibleDeps, variations, false, false)
+	found, _ := m.context.findVariant(m.module, m.config, possibleDeps, variations, false, false)
 	return found != nil
 }
 
@@ -584,7 +584,7 @@ func (m *baseModuleContext) OtherModuleFarDependencyVariantExists(variations []V
 	if possibleDeps == nil {
 		return false
 	}
-	found, _ := findVariant(m.module, possibleDeps, variations, true, false)
+	found, _ := m.context.findVariant(m.module, m.config, possibleDeps, variations, true, false)
 	return found != nil
 }
 
@@ -593,7 +593,7 @@ func (m *baseModuleContext) OtherModuleReverseDependencyVariantExists(name strin
 	if possibleDeps == nil {
 		return false
 	}
-	found, _ := findVariant(m.module, possibleDeps, nil, false, true)
+	found, _ := m.context.findVariant(m.module, m.config, possibleDeps, nil, false, true)
 	return found != nil
 }
 
@@ -924,15 +924,14 @@ type BottomUpMutatorContext interface {
 	// WalkDeps, etc.
 	AddInterVariantDependency(tag DependencyTag, from, to Module)
 
-	// ReplaceDependencies replaces all dependencies on the identical variant of the module with the
-	// specified name with the current variant of this module.  Replacements don't take effect until
-	// after the mutator pass is finished.
+	// ReplaceDependencies finds all the variants of the module with the specified name, then
+	// replaces all dependencies onto those variants with the current variant of this module.
+	// Replacements don't take effect until after the mutator pass is finished.
 	ReplaceDependencies(string)
 
-	// ReplaceDependenciesIf replaces all dependencies on the identical variant of the module with the
-	// specified name with the current variant of this module as long as the supplied predicate returns
-	// true.
-	//
+	// ReplaceDependenciesIf finds all the variants of the module with the specified name, then
+	// replaces all dependencies onto those variants with the current variant of this module
+	// as long as the supplied predicate returns true.
 	// Replacements don't take effect until after the mutator pass is finished.
 	ReplaceDependenciesIf(string, ReplaceDependencyPredicate)
 
@@ -1117,7 +1116,7 @@ func (mctx *mutatorContext) AddDependency(module Module, tag DependencyTag, deps
 	depInfos := make([]Module, 0, len(deps))
 	for _, dep := range deps {
 		modInfo := mctx.context.moduleInfo[module]
-		depInfo, errs := mctx.context.addDependency(modInfo, tag, dep)
+		depInfo, errs := mctx.context.addDependency(modInfo, mctx.config, tag, dep)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
@@ -1135,7 +1134,7 @@ func (mctx *mutatorContext) AddReverseDependency(module Module, tag DependencyTa
 		panic("BaseDependencyTag is not allowed to be used directly!")
 	}
 
-	destModule, errs := mctx.context.findReverseDependency(mctx.context.moduleInfo[module], destName)
+	destModule, errs := mctx.context.findReverseDependency(mctx.context.moduleInfo[module], mctx.config, destName)
 	if len(errs) > 0 {
 		mctx.errs = append(mctx.errs, errs...)
 		return
@@ -1152,7 +1151,7 @@ func (mctx *mutatorContext) AddVariationDependencies(variations []Variation, tag
 
 	depInfos := make([]Module, 0, len(deps))
 	for _, dep := range deps {
-		depInfo, errs := mctx.context.addVariationDependency(mctx.module, variations, tag, dep, false)
+		depInfo, errs := mctx.context.addVariationDependency(mctx.module, mctx.config, variations, tag, dep, false)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
@@ -1170,7 +1169,7 @@ func (mctx *mutatorContext) AddFarVariationDependencies(variations []Variation, 
 
 	depInfos := make([]Module, 0, len(deps))
 	for _, dep := range deps {
-		depInfo, errs := mctx.context.addVariationDependency(mctx.module, variations, tag, dep, true)
+		depInfo, errs := mctx.context.addVariationDependency(mctx.module, mctx.config, variations, tag, dep, true)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
@@ -1194,9 +1193,9 @@ func (mctx *mutatorContext) ReplaceDependencies(name string) {
 type ReplaceDependencyPredicate func(from Module, tag DependencyTag, to Module) bool
 
 func (mctx *mutatorContext) ReplaceDependenciesIf(name string, predicate ReplaceDependencyPredicate) {
-	target := mctx.context.moduleMatchingVariant(mctx.module, name)
+	targets := mctx.context.moduleVariantsThatDependOn(name, mctx.module)
 
-	if target == nil {
+	if len(targets) == 0 {
 		panic(fmt.Errorf("ReplaceDependencies could not find identical variant {%s} for module %s\n"+
 			"available variants:\n  %s",
 			mctx.context.prettyPrintVariant(mctx.module.variant.variations),
@@ -1204,7 +1203,9 @@ func (mctx *mutatorContext) ReplaceDependenciesIf(name string, predicate Replace
 			mctx.context.prettyPrintGroupVariants(mctx.context.moduleGroupFromName(name, mctx.module.namespace()))))
 	}
 
-	mctx.replace = append(mctx.replace, replace{target, mctx.module, predicate})
+	for _, target := range targets {
+		mctx.replace = append(mctx.replace, replace{target, mctx.module, predicate})
+	}
 }
 
 func (mctx *mutatorContext) Rename(name string) {
