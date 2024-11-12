@@ -15,8 +15,10 @@
 package blueprint
 
 import (
+	"encoding/gob"
 	"fmt"
 
+	"github.com/google/blueprint/gobtools"
 	"github.com/google/blueprint/proptools"
 )
 
@@ -53,6 +55,34 @@ type providerKey struct {
 	mutator string
 }
 
+type providerKeyGob struct {
+	Id      int
+	Typ     string
+	Mutator string
+}
+
+func (m *providerKey) ToGob() *providerKeyGob {
+	return &providerKeyGob{
+		Id:      m.id,
+		Typ:     m.typ,
+		Mutator: m.mutator,
+	}
+}
+
+func (m *providerKey) FromGob(data *providerKeyGob) {
+	m.id = data.Id
+	m.typ = data.Typ
+	m.mutator = data.Mutator
+}
+
+func (m *providerKey) GobEncode() ([]byte, error) {
+	return gobtools.CustomGobEncode[providerKeyGob](m)
+}
+
+func (m *providerKey) GobDecode(data []byte) error {
+	return gobtools.CustomGobDecode[providerKeyGob](data, m)
+}
+
 func (p *providerKey) provider() *providerKey { return p }
 
 type AnyProviderKey interface {
@@ -73,6 +103,8 @@ var providerRegistry []*providerKey
 // inside GenerateBuildActions for the module, and to get the value from GenerateBuildActions from
 // any module later in the build graph.
 func NewProvider[K any]() ProviderKey[K] {
+	var defaultValue K
+	gob.Register(defaultValue)
 	return NewMutatorProvider[K]("")
 }
 
@@ -154,16 +186,14 @@ func (c *Context) setProvider(m *moduleInfo, provider *providerKey, value any) {
 
 	m.providers[provider.id] = value
 
-	if c.verifyProvidersAreUnchanged {
-		if m.providerInitialValueHashes == nil {
-			m.providerInitialValueHashes = make([]uint64, len(providerRegistry))
-		}
-		hash, err := proptools.CalculateHash(value)
-		if err != nil {
-			panic(fmt.Sprintf("Can't set value of provider %s: %s", provider.typ, err.Error()))
-		}
-		m.providerInitialValueHashes[provider.id] = hash
+	if m.providerInitialValueHashes == nil {
+		m.providerInitialValueHashes = make([]uint64, len(providerRegistry))
 	}
+	hash, err := proptools.CalculateHash(value)
+	if err != nil {
+		panic(fmt.Sprintf("Can't set value of provider %s: %s", provider.typ, err.Error()))
+	}
+	m.providerInitialValueHashes[provider.id] = hash
 }
 
 // provider returns the value, if any, for a given provider for a module.  Verifies that it is
@@ -196,35 +226,21 @@ func (c *Context) provider(m *moduleInfo, provider *providerKey) (any, bool) {
 }
 
 func (c *Context) mutatorFinishedForModule(mutator *mutatorInfo, m *moduleInfo) bool {
-	if c.finishedMutators[mutator] {
+	if c.finishedMutators[mutator.index] {
 		// mutator pass finished for all modules
 		return true
 	}
 
-	if c.startedMutator == mutator {
-		// mutator pass started, check if it is finished for this module
-		return m.finishedMutator == mutator
-	}
-
-	// mutator pass hasn't started
-	return false
+	return m.finishedMutator >= mutator.index
 }
 
 func (c *Context) mutatorStartedForModule(mutator *mutatorInfo, m *moduleInfo) bool {
-	if c.finishedMutators[mutator] {
+	if c.finishedMutators[mutator.index] {
 		// mutator pass finished for all modules
 		return true
 	}
 
-	if c.startedMutator == mutator {
-		// mutator pass is currently running
-		if m.startedMutator == mutator {
-			// mutator has started for this module
-			return true
-		}
-	}
-
-	return false
+	return m.startedMutator >= mutator.index
 }
 
 // OtherModuleProviderContext is a helper interface that is a subset of ModuleContext, BottomUpMutatorContext, or

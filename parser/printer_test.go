@@ -735,6 +735,56 @@ foo {
 }
 `,
 	},
+	{
+		name: "Select with bindings",
+		input: `
+foo {
+    stuff: select(arch(), {
+        "x86": "a",
+        any
+          @ baz: "b" + baz,
+    }),
+}
+`,
+		output: `
+foo {
+    stuff: select(arch(), {
+        "x86": "a",
+        any @ baz: "b" + baz,
+    }),
+}
+`,
+	},
+	{
+		name: "Simplify select",
+		input: `
+foo {
+    stuff: select(arch(), {
+        default: "a",
+    }),
+}
+`,
+		output: `
+foo {
+    stuff: "a",
+}
+`,
+	},
+	{
+		name: "Simplify select with append",
+		input: `
+foo {
+    stuff: select(arch(), {
+        default: "a",
+    }) + "foo",
+}
+`,
+		output: `
+foo {
+    stuff: "a" + "foo",
+}
+`,
+	},
 }
 
 func TestPrinter(t *testing.T) {
@@ -744,7 +794,7 @@ func TestPrinter(t *testing.T) {
 			expected := testCase.output[1:]
 
 			r := bytes.NewBufferString(in)
-			file, errs := Parse("", r, NewScope(nil))
+			file, errs := Parse("", r)
 			if len(errs) != 0 {
 				t.Errorf("test case: %s", in)
 				t.Errorf("unexpected errors:")

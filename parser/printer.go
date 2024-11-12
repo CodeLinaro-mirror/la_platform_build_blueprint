@@ -99,7 +99,7 @@ func (p *printer) printAssignment(assignment *Assignment) {
 	p.requestSpace()
 	p.printToken(assignment.Assigner, assignment.EqualsPos)
 	p.requestSpace()
-	p.printExpression(assignment.OrigValue)
+	p.printExpression(assignment.Value)
 	p.requestNewline()
 }
 
@@ -134,20 +134,36 @@ func (p *printer) printExpression(value Expression) {
 	case *Select:
 		p.printSelect(v)
 	default:
-		panic(fmt.Errorf("bad property type: %s", value.Type()))
+		panic(fmt.Errorf("bad property type: %v", value))
 	}
 }
 
 func (p *printer) printSelect(s *Select) {
+	print_append := func() {
+		if s.Append != nil {
+			p.requestSpace()
+			p.printToken("+", s.RBracePos)
+			p.requestSpace()
+			p.printExpression(s.Append)
+		}
+	}
 	if len(s.Cases) == 0 {
+		print_append()
 		return
 	}
 	if len(s.Cases) == 1 && len(s.Cases[0].Patterns) == 1 {
-		if str, ok := s.Cases[0].Patterns[0].(*String); ok && str.Value == default_select_branch_name {
+		if str, ok := s.Cases[0].Patterns[0].Value.(*String); ok && str.Value == default_select_branch_name {
 			p.printExpression(s.Cases[0].Value)
 			p.pos = s.RBracePos
+			print_append()
 			return
 		}
+	}
+	if len(s.Cases) == 1 && len(s.Cases[0].Patterns) == 0 {
+		p.printExpression(s.Cases[0].Value)
+		p.pos = s.RBracePos
+		print_append()
+		return
 	}
 	p.requestSpace()
 	p.printToken("select(", s.KeywordPos)
@@ -196,22 +212,7 @@ func (p *printer) printSelect(s *Select) {
 			p.printToken("(", p.pos)
 		}
 		for i, pat := range c.Patterns {
-			switch pat := pat.(type) {
-			case *String:
-				if pat.Value != default_select_branch_name {
-					p.printToken(strconv.Quote(pat.Value), pat.LiteralPos)
-				} else {
-					p.printToken("default", pat.LiteralPos)
-				}
-			case *Bool:
-				s := "false"
-				if pat.Value {
-					s = "true"
-				}
-				p.printToken(s, pat.LiteralPos)
-			default:
-				panic("Unhandled case")
-			}
+			p.printSelectPattern(pat)
 			if i < len(c.Patterns)-1 {
 				p.printToken(",", p.pos)
 				p.requestSpace()
@@ -222,7 +223,7 @@ func (p *printer) printSelect(s *Select) {
 		}
 		p.printToken(":", c.ColonPos)
 		p.requestSpace()
-		if unset, ok := c.Value.(UnsetProperty); ok {
+		if unset, ok := c.Value.(*UnsetProperty); ok {
 			p.printToken(unset.String(), unset.Pos())
 		} else {
 			p.printExpression(c.Value)
@@ -232,11 +233,33 @@ func (p *printer) printSelect(s *Select) {
 	p.requestNewline()
 	p.unindent(s.RBracePos)
 	p.printToken("})", s.RBracePos)
-	if s.Append != nil {
+	print_append()
+}
+
+func (p *printer) printSelectPattern(pat SelectPattern) {
+	switch pat := pat.Value.(type) {
+	case *String:
+		if pat.Value == default_select_branch_name {
+			p.printToken("default", pat.LiteralPos)
+		} else if pat.Value == any_select_branch_name {
+			p.printToken("any", pat.LiteralPos)
+		} else {
+			p.printToken(strconv.Quote(pat.Value), pat.LiteralPos)
+		}
+	case *Bool:
+		s := "false"
+		if pat.Value {
+			s = "true"
+		}
+		p.printToken(s, pat.LiteralPos)
+	default:
+		panic("Unhandled case")
+	}
+	if pat.Binding.Name != "" {
 		p.requestSpace()
-		p.printToken("+", s.RBracePos)
+		p.printToken("@", pat.Binding.Pos())
 		p.requestSpace()
-		p.printExpression(s.Append)
+		p.printExpression(&pat.Binding)
 	}
 }
 
