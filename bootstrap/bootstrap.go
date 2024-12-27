@@ -374,7 +374,6 @@ func (g *GoPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
 
 	buildGoPackage(ctx, pkgRoot, g.properties.PkgPath, archiveFile,
 		srcs, genSrcs, g.properties.EmbedSrcs)
-	blueprint.SetProvider(ctx, blueprint.SrcsFileProviderKey, blueprint.SrcsFileProviderData{SrcPaths: srcs})
 	blueprint.SetProvider(ctx, PackageProvider, &PackageInfo{
 		PkgPath:       g.properties.PkgPath,
 		PkgRoot:       pkgRoot,
@@ -540,7 +539,6 @@ func (g *GoBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 		})
 	}
 
-	blueprint.SetProvider(ctx, blueprint.SrcsFileProviderKey, blueprint.SrcsFileProviderData{SrcPaths: srcs})
 	blueprint.SetProvider(ctx, BinaryProvider, &BinaryInfo{
 		IntermediatePath: g.outputFile,
 		InstallPath:      g.installPath,
