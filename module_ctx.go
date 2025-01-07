@@ -106,6 +106,8 @@ type Module interface {
 	// during its generate phase.  This call should generate all Ninja build
 	// actions (rules, pools, and build statements) needed to build the module.
 	GenerateBuildActions(ModuleContext)
+
+	String() string
 }
 
 type ModuleProxy struct {
@@ -117,11 +119,13 @@ func CreateModuleProxy(module Module) ModuleProxy {
 		module: module,
 	}
 }
-
 func (m ModuleProxy) Name() string {
 	return m.module.Name()
 }
 
+func (m ModuleProxy) String() string {
+	return m.module.String()
+}
 func (m ModuleProxy) GenerateBuildActions(context ModuleContext) {
 	m.module.GenerateBuildActions(context)
 }
@@ -232,11 +236,6 @@ type BaseModuleContext interface {
 	// GetDirectDepWithTag returns the Module the direct dependency with the specified name, or nil if
 	// none exists.  It panics if the dependency does not have the specified tag.
 	GetDirectDepWithTag(name string, tag DependencyTag) Module
-
-	// GetDirectDep returns the Module and DependencyTag for the  direct dependency with the specified
-	// name, or nil if none exists.  If there are multiple dependencies on the same module it returns
-	// the first DependencyTag.
-	GetDirectDep(name string) (Module, DependencyTag)
 
 	// VisitDirectDeps calls visit for each direct dependency.  If there are multiple direct dependencies on the same
 	// module visit will be called multiple times on that module and OtherModuleDependencyTag will return a different
@@ -515,7 +514,7 @@ func (d *baseModuleContext) PropertyErrorf(property, format string,
 func (d *baseModuleContext) OtherModulePropertyErrorf(logicModule Module, property string, format string,
 	args ...interface{}) {
 
-	d.error(d.context.PropertyErrorf(logicModule, property, format, args...))
+	d.error(d.context.PropertyErrorf(getWrappedModule(logicModule), property, format, args...))
 }
 
 func (d *baseModuleContext) Failed() bool {
@@ -755,16 +754,6 @@ func (m *moduleContext) restoreModuleBuildActions() (bool, *BuildActionCacheKey)
 	}
 
 	return restored, cacheKey
-}
-
-func (m *baseModuleContext) GetDirectDep(name string) (Module, DependencyTag) {
-	for _, dep := range m.module.directDeps {
-		if dep.module.Name() == name {
-			return dep.module.logicModule, dep.tag
-		}
-	}
-
-	return nil, nil
 }
 
 func (m *baseModuleContext) GetDirectDepWithTag(name string, tag DependencyTag) Module {
@@ -1345,6 +1334,10 @@ type SimpleName struct {
 
 func (s *SimpleName) Name() string {
 	return s.Properties.Name
+}
+
+func (s *SimpleName) String() string {
+	return s.Name()
 }
 
 // Load Hooks
