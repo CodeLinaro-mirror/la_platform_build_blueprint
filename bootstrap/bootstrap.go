@@ -201,6 +201,7 @@ func writeFileRule(ctx blueprint.ModuleContext, outputFile string, content strin
 			Rule:        writeFile,
 			Outputs:     []string{outputFile},
 			Description: "write " + outputFile,
+			Optional:    true,
 			Args: map[string]string{
 				"content": content,
 			},
@@ -218,6 +219,7 @@ func writeFileRule(ctx blueprint.ModuleContext, outputFile string, content strin
 			Rule:        cat,
 			Inputs:      chunks,
 			Outputs:     []string{outputFile},
+			Optional:    true,
 			Description: "Merging to " + outputFile,
 		})
 		return
