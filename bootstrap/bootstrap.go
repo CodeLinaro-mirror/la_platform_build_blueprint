@@ -365,9 +365,8 @@ func (g *GoPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
 	// Don't build for test-only packages
 	if len(srcs) == 0 && len(genSrcs) == 0 {
 		ctx.Build(pctx, blueprint.BuildParams{
-			Rule:     touch,
-			Outputs:  []string{archiveFile},
-			Optional: true,
+			Rule:    touch,
+			Outputs: []string{archiveFile},
 		})
 		return
 	}
@@ -519,7 +518,6 @@ func (g *GoBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 		Inputs:    []string{archiveFile},
 		Implicits: linkDeps,
 		Args:      linkArgs,
-		Optional:  true,
 	})
 
 	g.outputFile = aoutFile
@@ -535,7 +533,7 @@ func (g *GoBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 			Outputs:     []string{g.installPath},
 			Inputs:      []string{aoutFile},
 			Validations: validations,
-			Optional:    !g.properties.Default,
+			Default:     g.properties.Default,
 		})
 	}
 
@@ -565,7 +563,6 @@ func buildGoPluginLoader(ctx blueprint.ModuleContext, pkgPath, pluginSrc string)
 			"pkg":     pkgPath,
 			"plugins": strings.Join(pluginPaths, " "),
 		},
-		Optional: true,
 	})
 
 	return ret
@@ -632,7 +629,6 @@ func buildGoPackage(ctx blueprint.ModuleContext, pkgRoot string,
 		Inputs:    srcFiles,
 		Implicits: deps,
 		Args:      compileArgs,
-		Optional:  true,
 	})
 }
 
@@ -661,7 +657,6 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
 		Args: map[string]string{
 			"pkg": pkgPath,
 		},
-		Optional: true,
 	})
 
 	linkDeps := []string{testPkgArchive}
@@ -685,7 +680,6 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
 			"pkgPath":  "main",
 			"incFlags": "-I " + testRoot,
 		},
-		Optional: true,
 	})
 
 	ctx.Build(pctx, blueprint.BuildParams{
@@ -696,7 +690,6 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
 		Args: map[string]string{
 			"libDirFlags": strings.Join(libDirFlags, " "),
 		},
-		Optional: true,
 	})
 
 	ctx.Build(pctx, blueprint.BuildParams{
@@ -708,7 +701,6 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
 			"pkg":       pkgPath,
 			"pkgSrcDir": filepath.Dir(testFiles[0]),
 		},
-		Optional: true,
 	})
 
 	return []string{testPassed}
@@ -806,10 +798,6 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 				"extra":   strings.Join(flags, " "),
 				"pool":    pool,
 			},
-			// soong_ui explicitly requests what it wants to be build. This is
-			// because the same Ninja file contains instructions to run
-			// soong_build, run bp2build and to generate the JSON module graph.
-			Optional:    true,
 			Description: i.Description,
 		})
 	}
@@ -820,6 +808,7 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 			Rule:    blueprint.Phony,
 			Outputs: []string{"blueprint_tools"},
 			Inputs:  blueprintTools,
+			Default: true,
 		})
 	}
 
@@ -828,14 +817,14 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 		Rule:    blueprint.Phony,
 		Outputs: []string{"blueprint_tests"},
 		Inputs:  blueprintTests,
+		Default: true,
 	})
 
 	// Add a phony target for running go tests
 	ctx.Build(pctx, blueprint.BuildParams{
-		Rule:     blueprint.Phony,
-		Outputs:  []string{"blueprint_go_packages"},
-		Inputs:   blueprintGoPackages,
-		Optional: true,
+		Rule:    blueprint.Phony,
+		Outputs: []string{"blueprint_go_packages"},
+		Inputs:  blueprintGoPackages,
 	})
 }
 
