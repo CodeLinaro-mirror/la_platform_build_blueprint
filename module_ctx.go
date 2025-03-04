@@ -412,6 +412,8 @@ type BaseModuleContext interface {
 
 	EarlyGetMissingDependencies() []string
 
+	EqualModules(m1, m2 Module) bool
+
 	base() *baseModuleContext
 }
 
@@ -557,7 +559,7 @@ type moduleContext struct {
 	handledMissingDeps bool
 }
 
-func EqualModules(m1, m2 Module) bool {
+func (m *baseModuleContext) EqualModules(m1, m2 Module) bool {
 	return getWrappedModule(m1) == getWrappedModule(m2)
 }
 
