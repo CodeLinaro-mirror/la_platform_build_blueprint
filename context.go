@@ -47,6 +47,7 @@ import (
 	"github.com/google/blueprint/metrics"
 	"github.com/google/blueprint/parser"
 	"github.com/google/blueprint/pathtools"
+	"github.com/google/blueprint/pool"
 	"github.com/google/blueprint/proptools"
 )
 
@@ -100,9 +101,9 @@ type Context struct {
 	mutatorInfo         []*mutatorInfo
 	variantMutatorNames []string
 
-	variantCreatingMutatorOrder []string
-
-	transitionMutators []*transitionMutatorImpl
+	completedTransitionMutators int
+	transitionMutators          []*transitionMutatorImpl
+	transitionMutatorNames      []string
 
 	needsUpdateDependencies uint32 // positive if a mutator modified the dependencies
 
@@ -359,12 +360,25 @@ type moduleInfo struct {
 	obsoletedByNewVariants bool
 
 	// Used by TransitionMutator implementations
-	transitionVariations     []string
-	currentTransitionMutator string
-	requiredVariationsLock   sync.Mutex
+
+	// incomingTransitionInfos stores the map from variation to TransitionInfo object for transitions that were
+	// requested by reverse dependencies.  It is updated by reverse dependencies and protected by
+	// incomingTransitionInfosLock.  It is invalid after the TransitionMutator top down mutator has run on
+	// this module.
+	incomingTransitionInfos     map[string]TransitionInfo
+	incomingTransitionInfosLock sync.Mutex
+	// splitTransitionInfos and splitTransitionVariations stores the list of TransitionInfo objects, and their
+	// corresponding variations, returned by Split or requested by reverse dependencies.  They are valid after the
+	// TransitionMutator top down mutator has run on this module, and invalid after the bottom up mutator has run.
+	splitTransitionInfos      []TransitionInfo
+	splitTransitionVariations []string
+	currentTransitionMutator  string
+
+	// transitionInfos stores the final TransitionInfo for this module indexed by transitionMutatorImpl.index
+	transitionInfos []TransitionInfo
 
 	// outgoingTransitionCache stores the final variation for each dependency, indexed by the source variation
-	// index in transitionVariations and then by the index of the dependency in directDeps
+	// index in splitTransitionInfos and then by the index of the dependency in directDeps
 	outgoingTransitionCache [][]string
 
 	// set during PrepareBuildActions
@@ -435,6 +449,13 @@ func (module *moduleInfo) ModuleCacheKey() string {
 	return fmt.Sprintf("%s-%s-%s-%s",
 		strings.ReplaceAll(filepath.Dir(module.relBlueprintsFile), "/", "."),
 		module.Name(), variant, module.typeName)
+}
+
+func (c *Context) setModuleTransitionInfo(module *moduleInfo, t *transitionMutatorImpl, info TransitionInfo) {
+	if len(module.transitionInfos) == 0 {
+		module.transitionInfos = make([]TransitionInfo, len(c.transitionMutators))
+	}
+	module.transitionInfos[t.index] = info
 }
 
 // A Variation is a way that a variant of a module differs from other variants of the same module.
@@ -536,11 +557,11 @@ type singletonInfo struct {
 
 type mutatorInfo struct {
 	// set during RegisterMutator
-	topDownMutator    TopDownMutator
-	bottomUpMutator   BottomUpMutator
-	name              string
-	index             int
-	transitionMutator *transitionMutatorImpl
+	transitionPropagateMutator func(BaseModuleContext)
+	bottomUpMutator            BottomUpMutator
+	name                       string
+	index                      int
+	transitionMutator          *transitionMutatorImpl
 
 	usesRename              bool
 	usesReverseDependencies bool
@@ -548,7 +569,6 @@ type mutatorInfo struct {
 	usesCreateModule        bool
 	mutatesDependencies     bool
 	mutatesGlobalState      bool
-	neverFar                bool
 }
 
 func newContext() *Context {
@@ -785,27 +805,20 @@ func singletonTypeName(singleton Singleton) string {
 	return typ.PkgPath() + "." + typ.Name()
 }
 
-// RegisterTopDownMutator registers a mutator that will be invoked to propagate dependency info
-// top-down between Modules.  Each registered mutator is invoked in registration order (mixing
-// TopDownMutators and BottomUpMutators) once per Module, and the invocation on any module will
-// have returned before it is in invoked on any of its dependencies.
-//
-// The mutator type names given here must be unique to all top down mutators in
-// the Context.
-//
-// Returns a MutatorHandle, on which Parallel can be called to set the mutator to visit modules in
-// parallel while maintaining ordering.
-func (c *Context) RegisterTopDownMutator(name string, mutator TopDownMutator) MutatorHandle {
+// registerTransitionPropagateMutator registers a mutator that will be invoked to propagate transition mutator
+// configuration info top-down between Modules.
+func (c *Context) registerTransitionPropagateMutator(name string, mutator func(mctx BaseModuleContext)) MutatorHandle {
 	for _, m := range c.mutatorInfo {
-		if m.name == name && m.topDownMutator != nil {
+		if m.name == name && m.transitionPropagateMutator != nil {
 			panic(fmt.Errorf("mutator %q is already registered", name))
 		}
 	}
 
 	info := &mutatorInfo{
-		topDownMutator: mutator,
-		name:           name,
-		index:          len(c.mutatorInfo),
+		transitionPropagateMutator: mutator,
+
+		name:  name,
+		index: len(c.mutatorInfo),
 	}
 
 	c.mutatorInfo = append(c.mutatorInfo, info)
@@ -814,15 +827,11 @@ func (c *Context) RegisterTopDownMutator(name string, mutator TopDownMutator) Mu
 }
 
 // RegisterBottomUpMutator registers a mutator that will be invoked to split Modules into variants.
-// Each registered mutator is invoked in registration order (mixing TopDownMutators and
-// BottomUpMutators) once per Module, will not be invoked on a module until the invocations on all
-// of the modules dependencies have returned.
+// Each registered mutator is invoked in registration order once per Module, and will not be invoked on a
+// module until the invocations on all of the modules dependencies have returned.
 //
 // The mutator type names given here must be unique to all bottom up or early
 // mutators in the Context.
-//
-// Returns a MutatorHandle, on which Parallel can be called to set the mutator to visit modules in
-// parallel while maintaining ordering.
 func (c *Context) RegisterBottomUpMutator(name string, mutator BottomUpMutator) MutatorHandle {
 	for _, m := range c.variantMutatorNames {
 		if m == name {
@@ -879,7 +888,6 @@ type MutatorHandle interface {
 	MutatesGlobalState() MutatorHandle
 
 	setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle
-	setNeverFar() MutatorHandle
 }
 
 func (mutator *mutatorInfo) UsesRename() MutatorHandle {
@@ -914,11 +922,6 @@ func (mutator *mutatorInfo) MutatesGlobalState() MutatorHandle {
 
 func (mutator *mutatorInfo) setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle {
 	mutator.transitionMutator = impl
-	return mutator
-}
-
-func (mutator *mutatorInfo) setNeverFar() MutatorHandle {
-	mutator.neverFar = true
 	return mutator
 }
 
@@ -1666,6 +1669,7 @@ func (c *Context) createVariations(origModule *moduleInfo, mutator *mutatorInfo,
 		newModule.properties = newProperties
 		newModule.providers = slices.Clone(origModule.providers)
 		newModule.providerInitialValueHashes = slices.Clone(origModule.providerInitialValueHashes)
+		newModule.transitionInfos = slices.Clone(origModule.transitionInfos)
 
 		newModules = append(newModules, newModule)
 
@@ -1710,20 +1714,6 @@ func chooseDepByIndexes(mutatorName string, variations [][]string) depChooser {
 	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
 		desiredVariation := variations[variationIndex][depIndex]
 		return chooseDep(dep.module.splitModules, mutatorName, desiredVariation, nil)
-	}
-}
-
-func chooseDepExplicit(mutatorName string,
-	variationName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
-		return chooseDep(dep.module.splitModules, mutatorName, variationName, defaultVariationName)
-	}
-}
-
-func chooseDepInherit(mutatorName string, defaultVariationName *string) depChooser {
-	return func(source *moduleInfo, variationIndex, depIndex int, dep depInfo) (*moduleInfo, string) {
-		sourceVariation := source.variant.variations.get(mutatorName)
-		return chooseDep(dep.module.splitModules, mutatorName, sourceVariation, defaultVariationName)
 	}
 }
 
@@ -2002,28 +1992,37 @@ func (c *Context) findReverseDependency(module *moduleInfo, config any, requeste
 // modify the requested variation.  It finds a variant that existed before the TransitionMutator ran that is
 // a subset of the requested variant to use as the module context for IncomingTransition.
 func (c *Context) applyTransitions(config any, module *moduleInfo, group *moduleGroup, variant variationMap,
-	requestedVariations []Variation) (variationMap, []error) {
-	for _, transitionMutator := range c.transitionMutators {
+	requestedVariations []Variation, far bool) (variationMap, []error) {
+	for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
 		explicitlyRequested := slices.ContainsFunc(requestedVariations, func(variation Variation) bool {
 			return variation.Mutator == transitionMutator.name
 		})
 
-		sourceVariation := variant.get(transitionMutator.name)
-		outgoingVariation := sourceVariation
-
-		// Apply the outgoing transition if it was not explicitly requested.
-		if !explicitlyRequested {
-			ctx := &outgoingTransitionContextImpl{
+		var outgoingTransitionInfo TransitionInfo
+		if explicitlyRequested {
+			sourceVariation := variant.get(transitionMutator.name)
+			outgoingTransitionInfo = transitionMutator.mutator.TransitionInfoFromVariation(sourceVariation)
+		} else {
+			// Apply the outgoing transition if it was not explicitly requested.
+			var srcTransitionInfo TransitionInfo
+			if (!far || transitionMutator.neverFar) && len(module.transitionInfos) > transitionMutator.index {
+				srcTransitionInfo = module.transitionInfos[transitionMutator.index]
+			}
+			ctx := outgoingTransitionContextPool.Get()
+			*ctx = outgoingTransitionContextImpl{
 				transitionContextImpl{context: c, source: module, dep: nil,
 					depTag: nil, postMutator: true, config: config},
 			}
-			outgoingVariation = transitionMutator.mutator.OutgoingTransition(ctx, sourceVariation)
-			if len(ctx.errs) > 0 {
-				return variationMap{}, ctx.errs
+			outgoingTransitionInfo = transitionMutator.mutator.OutgoingTransition(ctx, srcTransitionInfo)
+			errs := ctx.errs
+			outgoingTransitionContextPool.Put(ctx)
+			ctx = nil
+			if len(errs) > 0 {
+				return variationMap{}, errs
 			}
 		}
 
-		earlierVariantCreatingMutators := c.variantCreatingMutatorOrder[:transitionMutator.variantCreatingMutatorIndex]
+		earlierVariantCreatingMutators := c.transitionMutatorNames[:transitionMutator.index]
 		filteredVariant := variant.cloneMatching(earlierVariantCreatingMutators)
 
 		check := func(inputVariant variationMap) bool {
@@ -2056,16 +2055,24 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, group *module
 
 		if matchingInputVariant != nil {
 			// Apply the incoming transition.
-			ctx := &incomingTransitionContextImpl{
+			ctx := incomingTransitionContextPool.Get()
+			*ctx = incomingTransitionContextImpl{
 				transitionContextImpl{context: c, source: nil, dep: matchingInputVariant,
 					depTag: nil, postMutator: true, config: config},
 			}
 
-			finalVariation := transitionMutator.mutator.IncomingTransition(ctx, outgoingVariation)
-			if len(ctx.errs) > 0 {
-				return variationMap{}, ctx.errs
+			finalTransitionInfo := transitionMutator.mutator.IncomingTransition(ctx, outgoingTransitionInfo)
+			errs := ctx.errs
+			incomingTransitionContextPool.Put(ctx)
+			ctx = nil
+			if len(errs) > 0 {
+				return variationMap{}, errs
 			}
-			variant.set(transitionMutator.name, finalVariation)
+			variation := ""
+			if finalTransitionInfo != nil {
+				variation = finalTransitionInfo.Variation()
+			}
+			variant.set(transitionMutator.name, variation)
 		}
 
 		if (matchingInputVariant == nil && !explicitlyRequested) || variant.get(transitionMutator.name) == "" {
@@ -2088,9 +2095,9 @@ func (c *Context) findVariant(module *moduleInfo, config any,
 	if !far {
 		newVariant = module.variant.variations.clone()
 	} else {
-		for _, mutator := range c.mutatorInfo {
-			if mutator.neverFar {
-				newVariant.set(mutator.name, module.variant.variations.get(mutator.name))
+		for _, transitionMutator := range c.transitionMutators {
+			if transitionMutator.neverFar {
+				newVariant.set(transitionMutator.name, module.variant.variations.get(transitionMutator.name))
 			}
 		}
 	}
@@ -2100,7 +2107,7 @@ func (c *Context) findVariant(module *moduleInfo, config any,
 
 	if !reverse {
 		var errs []error
-		newVariant, errs = c.applyTransitions(config, module, possibleDeps, newVariant, requestedVariations)
+		newVariant, errs = c.applyTransitions(config, module, possibleDeps, newVariant, requestedVariations, far)
 		if len(errs) > 0 {
 			return nil, variationMap{}, errs
 		}
@@ -2855,6 +2862,10 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 			return
 		}
 
+		pprof.Do(c.Context, pprof.Labels("blueprint", "GC"), func(ctx context.Context) {
+			runtime.GC()
+		})
+
 		var depsSingletons []string
 		depsSingletons, errs = c.generateSingletonBuildActions(config, c.singletonInfo, c.liveGlobals)
 		if len(errs) > 0 {
@@ -2909,7 +2920,7 @@ func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGr
 				c.BeginEvent(name)
 				defer c.EndEvent(name)
 				var newDeps []string
-				if mutatorGroup[0].topDownMutator != nil {
+				if mutatorGroup[0].transitionPropagateMutator != nil {
 					newDeps, errs = c.runMutator(config, mutatorGroup, topDownMutator)
 				} else if mutatorGroup[0].bottomUpMutator != nil {
 					newDeps, errs = c.runMutator(config, mutatorGroup, bottomUpMutator)
@@ -2965,7 +2976,7 @@ func (topDownMutatorImpl) run(mutatorGroup []*mutatorInfo, ctx *mutatorContext) 
 	if len(mutatorGroup) > 1 {
 		panic(fmt.Errorf("top down mutator group %s must only have 1 mutator, found %d", mutatorGroup[0].name, len(mutatorGroup)))
 	}
-	mutatorGroup[0].topDownMutator(ctx)
+	mutatorGroup[0].transitionPropagateMutator(ctx)
 }
 
 func (topDownMutatorImpl) orderer() visitOrderer {
@@ -2985,6 +2996,8 @@ type reverseDep struct {
 	module *moduleInfo
 	dep    depInfo
 }
+
+var mutatorContextPool = pool.New[mutatorContext]()
 
 func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	direction mutatorDirection) (deps []string, errs []error) {
@@ -3021,7 +3034,8 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			panic("split module found in sorted module list")
 		}
 
-		mctx := &mutatorContext{
+		mctx := mutatorContextPool.Get()
+		*mctx = mutatorContext{
 			baseModuleContext: baseModuleContext{
 				context: c,
 				config:  config,
@@ -3052,29 +3066,31 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 		module.finishedMutator = mutatorGroup[len(mutatorGroup)-1].index
 
+		hasErrors := false
 		if len(mctx.errs) > 0 {
 			errsCh <- mctx.errs
-			return true
-		}
+			hasErrors = true
+		} else {
+			if len(mctx.newVariations) > 0 {
+				newVariationsCh <- newVariationPair{mctx.newVariations, origLogicModule}
+			}
 
-		if len(mctx.newVariations) > 0 {
-			newVariationsCh <- newVariationPair{mctx.newVariations, origLogicModule}
-		}
-
-		if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 {
-			globalStateCh <- globalStateChange{
-				reverse:    mctx.reverseDeps,
-				replace:    mctx.replace,
-				rename:     mctx.rename,
-				newModules: mctx.newModules,
-				deps:       mctx.ninjaFileDeps,
+			if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 {
+				globalStateCh <- globalStateChange{
+					reverse:    mctx.reverseDeps,
+					replace:    mctx.replace,
+					rename:     mctx.rename,
+					newModules: mctx.newModules,
+					deps:       mctx.ninjaFileDeps,
+				}
 			}
 		}
+		mutatorContextPool.Put(mctx)
+		mctx = nil
 
-		return false
+		return hasErrors
 	}
 
-	createdVariations := false
 	var obsoleteLogicModules []Module
 
 	// Process errs and reverseDeps in a single goroutine
@@ -3098,7 +3114,6 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 				for _, module := range newVariations.newVariations {
 					newModuleInfo[module.logicModule] = module
 				}
-				createdVariations = true
 			case <-done:
 				return
 			}
@@ -3127,10 +3142,10 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 	c.moduleInfo = newModuleInfo
 
-	isTransitionMutator := mutatorGroup[0].transitionMutator != nil
+	transitionMutator := mutatorGroup[0].transitionMutator
 
 	var transitionMutatorInputVariants map[*moduleGroup][]*moduleInfo
-	if isTransitionMutator {
+	if transitionMutator != nil {
 		transitionMutatorInputVariants = make(map[*moduleGroup][]*moduleInfo)
 	}
 
@@ -3140,7 +3155,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 			// Update module group to contain newly split variants
 			if module.splitModules != nil {
-				if isTransitionMutator {
+				if transitionMutator != nil {
 					// For transition mutators, save the pre-split variant for reusing later in applyTransitions.
 					transitionMutatorInputVariants[group] = append(transitionMutatorInputVariants[group], module)
 				}
@@ -3168,14 +3183,9 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}
 
-	if isTransitionMutator {
-		mutatorGroup[0].transitionMutator.inputVariants = transitionMutatorInputVariants
-		mutatorGroup[0].transitionMutator.variantCreatingMutatorIndex = len(c.variantCreatingMutatorOrder)
-		c.transitionMutators = append(c.transitionMutators, mutatorGroup[0].transitionMutator)
-	}
-
-	if createdVariations {
-		c.variantCreatingMutatorOrder = append(c.variantCreatingMutatorOrder, mutatorGroup[0].name)
+	if transitionMutator != nil {
+		transitionMutator.inputVariants = transitionMutatorInputVariants
+		c.completedTransitionMutators = transitionMutator.index + 1
 	}
 
 	// Add in any new reverse dependencies that were added by the mutator
@@ -4729,7 +4739,6 @@ func orderOnlyForIncremental(c *Context, modules []*moduleInfo, phonys *localBui
 				Rule:          Phony,
 				OutputStrings: []string{dep},
 				InputStrings:  orderOnlyStrings,
-				Optional:      true,
 			}
 			phonys.buildDefs = append(phonys.buildDefs, &phony)
 			c.orderOnlyStringsToCache[dep] = orderOnlyStrings
@@ -4943,7 +4952,6 @@ func scanBuildDef(candidates *sync.Map, b *buildDef, incremental bool) {
 					Rule:          Phony,
 					OutputStrings: []string{fmt.Sprintf("dedup-%x", key)},
 					InputStrings:  m.first.OrderOnlyStrings,
-					Optional:      true,
 				}
 				// the previously recorded build-def, which first had these deps as its
 				// order-only deps, should now use this phony output instead
