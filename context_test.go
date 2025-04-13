@@ -785,14 +785,21 @@ func Test_parallelVisit(t *testing.T) {
 	moduleF := create("F")
 	moduleG := create("G")
 
+	moduleH := create("H")
+	moduleI := create("I")
+	moduleJ := create("J")
+
 	// A depends on B, B depends on C.  Nothing depends on D through G, and they don't depend on
-	// anything.
+	// anything. H depends on I, and I and J depend on each other.
 	addDep(moduleA, moduleB)
 	addDep(moduleB, moduleC)
+	addDep(moduleH, moduleI)
+	addDep(moduleI, moduleJ)
+	addDep(moduleJ, moduleI)
 
 	t.Run("no modules", func(t *testing.T) {
 		errs := parallelVisit(slices.Values([]*moduleInfo(nil)), bottomUpVisitorImpl{}, 1,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				panic("unexpected call to visitor")
 			})
 		if errs != nil {
@@ -802,7 +809,7 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("bottom up", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC}), bottomUpVisitorImpl{}, 1,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				order += module.group.name
 				return false
 			})
@@ -816,12 +823,10 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("pause", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC, moduleD}), bottomUpVisitorImpl{}, 1,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if module == moduleC {
 					// Pause module C on module D
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleC, moduleD, unpause}
-					<-unpause
+					pause(moduleD)
 				}
 				order += module.group.name
 				return false
@@ -836,7 +841,7 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("cancel", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC}), bottomUpVisitorImpl{}, 1,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				order += module.group.name
 				// Cancel in module B
 				return module == moduleB
@@ -851,12 +856,10 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("pause and cancel", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC, moduleD}), bottomUpVisitorImpl{}, 1,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if module == moduleC {
 					// Pause module C on module D
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleC, moduleD, unpause}
-					<-unpause
+					pause(moduleD)
 				}
 				order += module.group.name
 				// Cancel in module D
@@ -872,7 +875,7 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("parallel", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC}), bottomUpVisitorImpl{}, 3,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				order += module.group.name
 				return false
 			})
@@ -886,12 +889,10 @@ func Test_parallelVisit(t *testing.T) {
 	t.Run("pause existing", func(t *testing.T) {
 		order := ""
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC}), bottomUpVisitorImpl{}, 3,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if module == moduleA {
 					// Pause module A on module B (an existing dependency)
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleA, moduleB, unpause}
-					<-unpause
+					pause(moduleB)
 				}
 				order += module.group.name
 				return false
@@ -905,12 +906,10 @@ func Test_parallelVisit(t *testing.T) {
 	})
 	t.Run("cycle", func(t *testing.T) {
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC}), bottomUpVisitorImpl{}, 3,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if module == moduleC {
 					// Pause module C on module A (a dependency cycle)
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleC, moduleA, unpause}
-					<-unpause
+					pause(moduleA)
 				}
 				return false
 			})
@@ -935,18 +934,14 @@ func Test_parallelVisit(t *testing.T) {
 	})
 	t.Run("pause cycle", func(t *testing.T) {
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleA, moduleB, moduleC, moduleD}), bottomUpVisitorImpl{}, 3,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if module == moduleC {
 					// Pause module C on module D
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleC, moduleD, unpause}
-					<-unpause
+					pause(moduleD)
 				}
 				if module == moduleD {
 					// Pause module D on module C (a pause cycle)
-					unpause := make(chan struct{})
-					pause <- pauseSpec{moduleD, moduleC, unpause}
-					<-unpause
+					pause(moduleC)
 				}
 				return false
 			})
@@ -979,11 +974,9 @@ func Test_parallelVisit(t *testing.T) {
 			moduleE: moduleF,
 		}
 		errs := parallelVisit(slices.Values([]*moduleInfo{moduleD, moduleE, moduleF, moduleG}), bottomUpVisitorImpl{}, 4,
-			func(module *moduleInfo, pause chan<- pauseSpec) bool {
+			func(module *moduleInfo, pause pauseFunc) bool {
 				if dep, ok := pauseDeps[module]; ok {
-					unpause := make(chan struct{})
-					pause <- pauseSpec{module, dep, unpause}
-					<-unpause
+					pause(dep)
 				}
 				return false
 			})
@@ -991,6 +984,29 @@ func Test_parallelVisit(t *testing.T) {
 			`encountered dependency cycle`,
 			`module "G" depends on module "F"`,
 			`module "F" depends on module "G"`,
+		}
+		for i := range want {
+			if len(errs) <= i {
+				t.Errorf("missing error %s", want[i])
+			} else if !strings.Contains(errs[i].Error(), want[i]) {
+				t.Errorf("expected error %s, got %s", want[i], errs[i])
+			}
+		}
+		if len(errs) > len(want) {
+			for _, err := range errs[len(want):] {
+				t.Errorf("unexpected error %s", err.Error())
+			}
+		}
+	})
+	t.Run("existing cycle", func(t *testing.T) {
+		errs := parallelVisit(slices.Values([]*moduleInfo{moduleH, moduleI, moduleJ}), bottomUpVisitorImpl{}, 3,
+			func(module *moduleInfo, pause pauseFunc) bool {
+				return false
+			})
+		want := []string{
+			`encountered dependency cycle`,
+			`module "J" depends on module "I"`,
+			`module "I" depends on module "J"`,
 		}
 		for i := range want {
 			if len(errs) <= i {
@@ -2082,4 +2098,43 @@ func TestDisallowedMutatorMethods(t *testing.T) {
 		})
 	}
 
+}
+
+func Benchmark_parallelVisit(b *testing.B) {
+	b.ReportAllocs()
+	create := func(name string) *moduleInfo {
+		m := &moduleInfo{
+			group: &moduleGroup{
+				name: name,
+			},
+		}
+		m.group.modules = moduleList{m}
+		return m
+	}
+
+	addDep := func(from, to *moduleInfo) {
+		from.directDeps = append(from.directDeps, depInfo{to, nil})
+		from.forwardDeps = append(from.forwardDeps, to)
+		to.reverseDeps = append(to.reverseDeps, from)
+	}
+	_ = addDep
+
+	var modules []*moduleInfo
+
+	for i := range b.N {
+		modules = append(modules, create(strconv.Itoa(i)))
+		if i != 0 {
+			//addDep(modules[len(modules)-1], modules[len(modules)-2])
+		}
+	}
+
+	b.ResetTimer()
+	errs := parallelVisit(slices.Values(modules), bottomUpVisitorImpl{}, 1000,
+		func(module *moduleInfo, pause pauseFunc) bool {
+			//fmt.Println(module.group.name)
+			return false
+		})
+	if errs != nil {
+		b.Errorf("expected no errors, got %q", errs)
+	}
 }
