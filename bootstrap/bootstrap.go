@@ -269,6 +269,7 @@ var DocsPackageProvider = blueprint.NewMutatorProvider[*DocsPackageInfo]("bootst
 
 // A GoPackage is a module for building Go packages.
 type GoPackage struct {
+	blueprint.ModuleBase
 	blueprint.SimpleName
 	properties struct {
 		Deps      []string
@@ -385,6 +386,7 @@ func (g *GoPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
 
 // A GoBinary is a module for building executable binaries from Go sources.
 type GoBinary struct {
+	blueprint.ModuleBase
 	blueprint.SimpleName
 	properties struct {
 		Deps           []string
