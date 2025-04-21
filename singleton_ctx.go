@@ -102,6 +102,11 @@ type SingletonContext interface {
 	// VisitAllModuleProxies calls visit for each defined variant of each module in an unspecified order.
 	VisitAllModuleProxies(visit func(proxy ModuleProxy))
 
+	// VisitAllModulesOrProxies calls visit for each defined variant of each module in an unspecified order,
+	// passing a Module if the module did not call FreeModuleAfterGenerateBuildActions, or a ModuleProxy if
+	// it did.
+	VisitAllModulesOrProxies(visit func(ModuleOrProxy))
+
 	// VisitAllModules calls pred for each defined variant of each module in an unspecified order, and if pred returns
 	// true calls visit.
 	VisitAllModulesIf(pred func(Module) bool, visit func(Module))
@@ -149,6 +154,10 @@ type SingletonContext interface {
 	// all variants of a module.
 	PrimaryModuleProxy(module ModuleProxy) ModuleProxy
 
+	// IsPrimaryModule returns if the given module is the first variant. This can be used to perform
+	// singleton actions that are only done once for all variants of a module.
+	IsPrimaryModule(module ModuleOrProxy) bool
+
 	// IsFinalModule returns if the given module is the last variant. This can be used to perform
 	// singleton actions that are only done once for all variants of a module.
 	IsFinalModule(module ModuleOrProxy) bool
@@ -176,6 +185,8 @@ type SingletonContext interface {
 	// HasMutatorFinished returns true if the given mutator has finished running.
 	// It will panic if given an invalid mutator name.
 	HasMutatorFinished(mutatorName string) bool
+
+	GetIncrementalAnalysis() bool
 }
 
 var _ SingletonContext = (*singletonContext)(nil)
@@ -328,22 +339,15 @@ func (s *singletonContext) AddSubninja(file string) {
 }
 
 func (s *singletonContext) VisitAllModules(visit func(Module)) {
-	var visitingModule Module
-	defer func() {
-		if r := recover(); r != nil {
-			panic(newPanicErrorf(r, "VisitAllModules(%s) for module %s",
-				funcName(visit), visitingModule.info()))
-		}
-	}()
+	s.context.VisitAllModules(visit)
+}
 
-	s.context.VisitAllModules(func(m Module) {
-		visitingModule = m
-		visit(m)
-	})
+func (s *singletonContext) VisitAllModulesOrProxies(visit func(ModuleOrProxy)) {
+	s.context.VisitAllModulesOrProxies(visit)
 }
 
 func (s *singletonContext) VisitAllModuleProxies(visit func(proxy ModuleProxy)) {
-	s.VisitAllModules(visitProxyAdaptor(visit))
+	s.context.VisitAllModulesProxies(visit)
 }
 
 func (s *singletonContext) VisitAllModulesIf(pred func(Module) bool,
@@ -380,6 +384,10 @@ func (s *singletonContext) PrimaryModuleProxy(module ModuleProxy) ModuleProxy {
 	return ModuleProxy{s.context.primaryModule(module.info())}
 }
 
+func (s *singletonContext) IsPrimaryModule(module ModuleOrProxy) bool {
+	return s.context.IsPrimaryModule(module)
+}
+
 func (s *singletonContext) IsFinalModule(module ModuleOrProxy) bool {
 	return s.context.IsFinalModule(module)
 }
@@ -389,7 +397,7 @@ func (s *singletonContext) VisitAllModuleVariants(module Module, visit func(Modu
 }
 
 func (s *singletonContext) VisitAllModuleVariantProxies(module ModuleProxy, visit func(proxy ModuleProxy)) {
-	s.context.VisitAllModuleVariants(module, visitProxyAdaptor(visit))
+	s.context.VisitAllModuleVariantProxies(module, visitProxyAdaptor(visit))
 }
 
 func (s *singletonContext) AddNinjaFileDeps(deps ...string) {
@@ -431,8 +439,12 @@ func (s *singletonContext) HasMutatorFinished(mutatorName string) bool {
 	return s.context.HasMutatorFinished(mutatorName)
 }
 
-func visitProxyAdaptor(visit func(proxy ModuleProxy)) func(module Module) {
-	return func(module Module) {
+func visitProxyAdaptor(visit func(proxy ModuleProxy)) func(module ModuleProxy) {
+	return func(module ModuleProxy) {
 		visit(ModuleProxy{module.info()})
 	}
+}
+
+func (s *singletonContext) GetIncrementalAnalysis() bool {
+	return s.context.GetIncrementalAnalysis()
 }
