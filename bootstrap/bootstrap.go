@@ -235,7 +235,7 @@ type bootstrapDependencies interface {
 	bootstrapDeps(ctx blueprint.BottomUpMutatorContext)
 }
 
-var pluginDepTag = pluginDependencyTag{}
+var PluginDepTag = pluginDependencyTag{}
 
 func BootstrapDeps(ctx blueprint.BottomUpMutatorContext) {
 	if pkg, ok := ctx.Module().(bootstrapDependencies); ok {
@@ -312,7 +312,7 @@ func (g *GoPackage) DynamicDependencies(ctx blueprint.DynamicDependerModuleConte
 
 func (g *GoPackage) bootstrapDeps(ctx blueprint.BottomUpMutatorContext) {
 	for _, plugin := range g.properties.PluginFor {
-		ctx.AddReverseDependency(ctx.Module(), pluginDepTag, plugin)
+		ctx.AddReverseDependency(ctx.Module(), PluginDepTag, plugin)
 	}
 	blueprint.SetProvider(ctx, DocsPackageProvider, &DocsPackageInfo{
 		PkgPath: g.properties.PkgPath,
@@ -338,7 +338,7 @@ func (g *GoPackage) GenerateBuildActions(ctx blueprint.ModuleContext) {
 		filepath.FromSlash(g.properties.PkgPath)+".a")
 
 	ctx.VisitDepsDepthFirst(func(module blueprint.Module) {
-		if ctx.OtherModuleDependencyTag(module) == pluginDepTag {
+		if ctx.OtherModuleDependencyTag(module) == PluginDepTag {
 			hasPlugins = true
 		}
 	})
@@ -470,7 +470,7 @@ func (g *GoBinary) GenerateBuildActions(ctx blueprint.ModuleContext) {
 	}
 
 	ctx.VisitDirectDeps(func(module blueprint.Module) {
-		if ctx.OtherModuleDependencyTag(module) == pluginDepTag {
+		if ctx.OtherModuleDependencyTag(module) == PluginDepTag {
 			hasPlugins = true
 		}
 	})
@@ -553,7 +553,7 @@ func buildGoPluginLoader(ctx blueprint.ModuleContext, pkgPath, pluginSrc string)
 
 	var pluginPaths []string
 	ctx.VisitDirectDeps(func(module blueprint.Module) {
-		if ctx.OtherModuleDependencyTag(module) == pluginDepTag {
+		if ctx.OtherModuleDependencyTag(module) == PluginDepTag {
 			if info, ok := blueprint.OtherModuleProvider(ctx, module, PackageProvider); ok {
 				pluginPaths = append(pluginPaths, info.PkgPath)
 			}
@@ -734,8 +734,8 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 	var blueprintTests []string
 	// blueprintGoPackages contains all blueprint go packages that can be built in StageMain
 	var blueprintGoPackages []string
-	ctx.VisitAllModules(func(module blueprint.Module) {
-		if ctx.PrimaryModule(module) == module {
+	ctx.VisitAllModuleProxies(func(module blueprint.ModuleProxy) {
+		if ctx.IsPrimaryModule(module) {
 			if binaryInfo, ok := blueprint.SingletonModuleProvider(ctx, module, BinaryProvider); ok {
 				if binaryInfo.InstallPath != "" {
 					blueprintTools = append(blueprintTools, binaryInfo.InstallPath)
