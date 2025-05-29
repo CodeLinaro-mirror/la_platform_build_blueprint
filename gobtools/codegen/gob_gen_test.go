@@ -15,24 +15,49 @@
 package main
 
 import (
-	"encoding/gob"
 	"reflect"
 	"testing"
 
+	"github.com/google/blueprint/depset"
 	"github.com/google/blueprint/gobtools"
+	"github.com/google/blueprint/gobtools/test"
 	"github.com/google/blueprint/uniquelist"
 )
 
 func TestPathGobEncDec(t *testing.T) {
 	strValue := "string value for test"
 	defaultEcho := TestEcho{"111111111"}
-	gob.Register(&TestEcho{})
-	gob.Register(&gobtools.TypeStruct{})
+	transTestEcho := depset.New(depset.PREORDER, []TestEcho{defaultEcho}, nil)
+	depsetTestEcho := depset.New(depset.PREORDER, []TestEcho{defaultEcho}, []depset.DepSet[TestEcho]{transTestEcho})
+	transTestEchoInterface := depset.New(depset.PREORDER, []TestEchoInterface{defaultEcho}, nil)
+	depsetTestEchoInterface := depset.New(depset.PREORDER, []TestEchoInterface{defaultEcho}, []depset.DepSet[TestEchoInterface]{transTestEchoInterface})
 	testCases := []struct {
 		name    string
 		origin  gobtools.CustomEnc
 		decoded gobtools.CustomDec
 	}{
+		{
+			name:    "TestStruct with default values",
+			origin:  &TestStruct{},
+			decoded: &TestStruct{},
+		},
+		{
+			name: "TestStruct with value interface",
+			origin: &TestStruct{
+				f18: TestEcho{"aaaa"},
+				f21: uniquelist.Make([]TestEchoInterface{defaultEcho}),
+				f24: test.TypeStruct{Name: "fffffffff"},
+			},
+			decoded: &TestStruct{},
+		},
+		{
+			name: "TestStruct with depset values",
+			origin: &TestStruct{
+				f26: depsetTestEcho,
+				f27: depsetTestEchoInterface,
+			},
+			decoded: &TestStruct{},
+		},
 		{
 			name: "TestStruct",
 			origin: &TestStruct{
@@ -65,8 +90,8 @@ func TestPathGobEncDec(t *testing.T) {
 				f19: testStrings{"bbbb", "cccc", "dddd"},
 				f20: uniquelist.Make([]TestEcho{defaultEcho}),
 				f21: uniquelist.Make([]TestEchoInterface{&defaultEcho}),
-				f22: gobtools.TypeStruct{Name: "aaaaaaaaa"},
-				f23: []gobtools.TypeAlias{
+				f22: test.TypeStruct{Name: "aaaaaaaaa"},
+				f23: []test.TypeAlias{
 					{
 						{Name: "bbbbbbbbb"},
 						{Name: "ccccccccc"},
@@ -76,8 +101,8 @@ func TestPathGobEncDec(t *testing.T) {
 						{Name: "eeeeeeeee"},
 					},
 				},
-				f24: &gobtools.TypeStruct{Name: "fffffffff"},
-				f25: gobtools.TypeIdent{Name: "ggggggggg"},
+				f24: &test.TypeStruct{Name: "fffffffff"},
+				f25: test.TypeIdent{Name: "ggggggggg"},
 			},
 			decoded: &TestStruct{},
 		},
