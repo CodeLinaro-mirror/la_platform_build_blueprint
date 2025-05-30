@@ -56,6 +56,10 @@ type TestStruct struct {
 	f25 test.TypeIdent
 	f26 depset.DepSet[TestEcho]
 	f27 depset.DepSet[TestEchoInterface]
+	f28 map[int][]string
+	f29 [][]string
+	f30 depset.DepSet[string]
+	f31 any
 }
 
 type testStrings []string
@@ -68,3 +72,12 @@ type TestEcho struct {
 func (t TestEcho) EchoTest(string) string {
 	return t.EchoStr
 }
+
+// @auto-generate: gob
+type testEchos []TestEchoInterface
+
+// @auto-generate: gob
+type testStringMap map[string][]string
+
+// @auto-generate: gob
+type testEchoMap map[TestEcho]*TestEcho
