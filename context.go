@@ -427,8 +427,10 @@ type globResultCache struct {
 }
 
 type incrementalInfo struct {
-	incrementalRestored  bool
-	providersRestored    bool
+	incrementalRestored bool
+	providersRestored   bool
+	// Whether this module support incremental build.
+	incrementalSupported bool
 	providerRestoreLock  sync.Mutex
 	buildActionCacheKey  *BuildActionCacheKey
 	buildActionInputHash uint64
@@ -3271,7 +3273,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 	// Add in any new reverse dependencies that were added by the mutator
 	for module, deps := range reverseDeps {
-		sort.Sort(depSorter(deps))
+		sort.Sort(depSorter{deps, c.nameInterface})
 		module.directDeps = append(module.directDeps, deps...)
 		for _, dep := range deps {
 			module.forwardDeps = append(module.forwardDeps, dep.module)
@@ -4677,24 +4679,21 @@ func (c *Context) writeGlobalRules(nw *ninjaWriter) error {
 	return nil
 }
 
-type depSorter []depInfo
+type depSorter struct {
+	deps          []depInfo
+	nameInterface NameInterface
+}
 
 func (s depSorter) Len() int {
-	return len(s)
+	return len(s.deps)
 }
 
 func (s depSorter) Less(i, j int) bool {
-	iName := s[i].module.Name()
-	jName := s[j].module.Name()
-	if iName == jName {
-		iName = s[i].module.variant.name
-		jName = s[j].module.variant.name
-	}
-	return iName < jName
+	return moduleLess(s.deps[i].module, s.deps[j].module, s.nameInterface)
 }
 
 func (s depSorter) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
+	s.deps[i], s.deps[j] = s.deps[j], s.deps[i]
 }
 
 type moduleSorter struct {
@@ -4707,13 +4706,15 @@ func (s moduleSorter) Len() int {
 }
 
 func (s moduleSorter) Less(i, j int) bool {
-	iMod := s.modules[i]
-	jMod := s.modules[j]
-	iName := s.nameInterface.UniqueName(newNamespaceContext(iMod), iMod.group.name)
-	jName := s.nameInterface.UniqueName(newNamespaceContext(jMod), jMod.group.name)
+	return moduleLess(s.modules[i], s.modules[j], s.nameInterface)
+}
+
+func moduleLess(iMod, jMod *moduleInfo, nameInterface NameInterface) bool {
+	iName := nameInterface.UniqueName(newNamespaceContext(iMod), iMod.group.name)
+	jName := nameInterface.UniqueName(newNamespaceContext(jMod), jMod.group.name)
 	if iName == jName {
-		iVariantName := s.modules[i].variant.name
-		jVariantName := s.modules[j].variant.name
+		iVariantName := iMod.variant.name
+		jVariantName := jMod.variant.name
 		if iVariantName == jVariantName {
 			panic(fmt.Sprintf("duplicate module name: %s %s: %#v and %#v\n",
 				iName, iVariantName, iMod.variant.variations, jMod.variant.variations))
@@ -4752,7 +4753,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	var incModules []*moduleInfo
 
 	for module := range c.iterateAllVariants() {
-		if module.buildActionCacheKey != nil {
+		if module.incrementalSupported {
 			incModules = append(incModules, module)
 			continue
 		}
@@ -4817,19 +4818,31 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 			nw.Subninja(file)
 		}
 
+		suffix := ".ninja"
+		base := strings.TrimSuffix(ninjaFileName, suffix)
+		file := fmt.Sprintf("%s.incremental%s", base, suffix)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := writeIncrementalModules(c, file, incModules, headerTemplate)
+			if err != nil {
+				errorCh <- err
+			}
+		}()
+		nw.Subninja(file)
+
 		if c.GetIncrementalEnabled() {
-			suffix := ".ninja"
-			base := strings.TrimSuffix(ninjaFileName, suffix)
-			file := fmt.Sprintf("%s.incremental%s", base, suffix)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := writeIncrementalModules(c, file, incModules, headerTemplate)
-				if err != nil {
-					errorCh <- err
-				}
+				parallelVisit(slices.Values(incModules), unorderedVisitorImpl{}, parallelVisitLimit,
+					func(m *moduleInfo, pause pauseFunc) bool {
+						if !m.incrementalRestored {
+							c.cacheModuleBuildActions(m)
+						}
+						return false
+					})
 			}()
-			nw.Subninja(file)
 		}
 
 		go func() {
@@ -4866,71 +4879,81 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
 	defer baseBuf.Flush()
 	baseWriter := newNinjaWriter(baseBuf)
 
-	inMemoryWriter := bytes.NewBuffer(nil)
-	var moduleBytes []byte
-	for _, module := range modules {
-		if !module.incrementalRestored {
-			inMemoryWriter.Reset()
-			mWriter := newNinjaWriter(inMemoryWriter)
-			if err := c.writeModuleAction([]*moduleInfo{module}, mWriter, headerTemplate); err != nil {
+	if c.GetIncrementalEnabled() {
+		inMemoryWriter := bytes.NewBuffer(nil)
+		var moduleBytes []byte
+		buf := bytes.NewBuffer(nil)
+		for _, module := range modules {
+			if !module.incrementalRestored {
+				inMemoryWriter.Reset()
+				mWriter := newNinjaWriter(inMemoryWriter)
+				if err := c.writeOneModuleAction(module, mWriter, headerTemplate, buf); err != nil {
+					return err
+				}
+				moduleBytes = inMemoryWriter.Bytes()
+				c.buildActionsCache.writeNinjaStatements(c.EncContext, module.buildActionCacheKey, moduleBytes)
+			} else if moduleBytes, err = c.buildActionsCache.readNinjaStatements(c.EncContext, module.buildActionCacheKey); err != nil {
 				return err
 			}
-			moduleBytes = inMemoryWriter.Bytes()
-			c.cacheModuleBuildActions(module)
-			c.buildActionsCache.writeNinjaStatements(c.EncContext, module.buildActionCacheKey, moduleBytes)
-		} else if moduleBytes, err = c.buildActionsCache.readNinjaStatements(c.EncContext, module.buildActionCacheKey); err != nil {
-			return err
+			baseWriter.writer.Write(moduleBytes)
 		}
-		baseWriter.writer.Write(moduleBytes)
+		return nil
+	} else {
+		return c.writeModuleAction(modules, baseWriter, headerTemplate)
 	}
-	return nil
 }
 
 func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
 	buf := bytes.NewBuffer(nil)
-
 	for _, module := range modules {
-		if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 {
-			continue
-		}
-		buf.Reset()
-
-		// In order to make the bootstrap build manifest independent of the
-		// build dir we need to output the Blueprints file locations in the
-		// comments as paths relative to the source directory.
-		relPos := module.pos
-		relPos.Filename = module.relBlueprintsFile
-
-		// Get the name and location of the factory function for the module.
-		factoryFunc := runtime.FuncForPC(reflect.ValueOf(module.factory).Pointer())
-		factoryName := factoryFunc.Name()
-
-		infoMap := map[string]interface{}{
-			"name":      module.Name(),
-			"typeName":  module.typeName,
-			"goFactory": factoryName,
-			"pos":       relPos,
-			"variant":   module.variant.name,
-		}
-		if err := headerTemplate.Execute(buf, infoMap); err != nil {
+		if err := c.writeOneModuleAction(module, nw, headerTemplate, buf); err != nil {
 			return err
 		}
+	}
+	return nil
+}
 
-		if err := nw.Comment(buf.String()); err != nil {
-			return err
-		}
+func (c *Context) writeOneModuleAction(module *moduleInfo, nw *ninjaWriter, headerTemplate *template.Template, buf *bytes.Buffer) error {
+	if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 {
+		return nil
+	}
+	buf.Reset()
 
-		if err := nw.BlankLine(); err != nil {
-			return err
-		}
+	// In order to make the bootstrap build manifest independent of the
+	// build dir we need to output the Blueprints file locations in the
+	// comments as paths relative to the source directory.
+	relPos := module.pos
+	relPos.Filename = module.relBlueprintsFile
 
-		if err := c.writeLocalBuildActions(nw, &module.actionDefs); err != nil {
-			return err
-		}
+	// Get the name and location of the factory function for the module.
+	factoryFunc := runtime.FuncForPC(reflect.ValueOf(module.factory).Pointer())
+	factoryName := factoryFunc.Name()
 
-		if err := nw.BlankLine(); err != nil {
-			return err
-		}
+	infoMap := map[string]interface{}{
+		"name":      module.Name(),
+		"typeName":  module.typeName,
+		"goFactory": factoryName,
+		"pos":       relPos,
+		"variant":   module.variant.name,
+	}
+	if err := headerTemplate.Execute(buf, infoMap); err != nil {
+		return err
+	}
+
+	if err := nw.Comment(buf.String()); err != nil {
+		return err
+	}
+
+	if err := nw.BlankLine(); err != nil {
+		return err
+	}
+
+	if err := c.writeLocalBuildActions(nw, &module.actionDefs); err != nil {
+		return err
+	}
+
+	if err := nw.BlankLine(); err != nil {
+		return err
 	}
 
 	return nil
