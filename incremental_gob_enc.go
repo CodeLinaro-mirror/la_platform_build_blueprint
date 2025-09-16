@@ -12,7 +12,8 @@ func init() {
 	CachedProviderGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(CachedProvider) })
 	ProviderCachedDataGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(ProviderCachedData) })
 	ProviderHashGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(ProviderHash) })
-	BuildActionCachedDataGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(BuildActionCachedData) })
+	ModuleActionCachedDataGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(ModuleActionCachedData) })
+	SingletonActionCachedDataGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(SingletonActionCachedData) })
 	OrderOnlyStringsCacheGobRegId = gobtools.RegisterType(func() gobtools.CustomDec { return new(OrderOnlyStringsCache) })
 }
 
@@ -201,7 +202,7 @@ func (r ProviderHash) GetTypeId() int16 {
 	return ProviderHashGobRegId
 }
 
-func (r BuildActionCachedData) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
+func (r ModuleActionCachedData) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
 	var err error
 
 	if err = gobtools.EncodeSimple(buf, r.InputHash); err != nil {
@@ -255,7 +256,7 @@ func (r BuildActionCachedData) Encode(ctx gobtools.EncContext, buf *bytes.Buffer
 	return err
 }
 
-func (r *BuildActionCachedData) Decode(ctx gobtools.EncContext, buf *bytes.Reader) error {
+func (r *ModuleActionCachedData) Decode(ctx gobtools.EncContext, buf *bytes.Reader) error {
 	var err error
 
 	err = gobtools.DecodeSimple[uint64](buf, &r.InputHash)
@@ -309,10 +310,69 @@ func (r *BuildActionCachedData) Decode(ctx gobtools.EncContext, buf *bytes.Reade
 	return err
 }
 
-var BuildActionCachedDataGobRegId int16
+var ModuleActionCachedDataGobRegId int16
 
-func (r BuildActionCachedData) GetTypeId() int16 {
-	return BuildActionCachedDataGobRegId
+func (r ModuleActionCachedData) GetTypeId() int16 {
+	return ModuleActionCachedDataGobRegId
+}
+
+func (r SingletonActionCachedData) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
+	var err error
+
+	if r.ProviderHashes == nil {
+		if err = gobtools.EncodeSimple(buf, int32(-1)); err != nil {
+			return err
+		}
+	} else {
+		if err = gobtools.EncodeSimple(buf, int32(len(r.ProviderHashes))); err != nil {
+			return err
+		}
+		for k, v := range r.ProviderHashes {
+			if err = gobtools.EncodeSimple(buf, int64(k)); err != nil {
+				return err
+			}
+			if err = gobtools.EncodeSimple(buf, v); err != nil {
+				return err
+			}
+		}
+	}
+	return err
+}
+
+func (r *SingletonActionCachedData) Decode(ctx gobtools.EncContext, buf *bytes.Reader) error {
+	var err error
+
+	var val1 int32
+	err = gobtools.DecodeSimple[int32](buf, &val1)
+	if err != nil {
+		return err
+	}
+	if val1 != -1 {
+		r.ProviderHashes = make(map[int]uint64, val1)
+		for val2 := 0; val2 < int(val1); val2++ {
+			var k int
+			var v uint64
+			var val3 int64
+			err = gobtools.DecodeSimple[int64](buf, &val3)
+			if err != nil {
+				return err
+			}
+			k = int(val3)
+			err = gobtools.DecodeSimple[uint64](buf, &v)
+			if err != nil {
+				return err
+			}
+			r.ProviderHashes[k] = v
+		}
+	}
+
+	return err
+}
+
+var SingletonActionCachedDataGobRegId int16
+
+func (r SingletonActionCachedData) GetTypeId() int16 {
+	return SingletonActionCachedDataGobRegId
 }
 
 func (r OrderOnlyStringsCache) Encode(ctx gobtools.EncContext, buf *bytes.Buffer) error {
