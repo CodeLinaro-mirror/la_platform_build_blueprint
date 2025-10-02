@@ -447,7 +447,10 @@ type moduleIncrementalInfo struct {
 
 type commonIncrementalInfo struct {
 	incrementalRestored bool
-	providersRestored   bool
+	// hasUnrestoredProvider is true when the module has been restored from the cache and the provider
+	// (indexed in the same order as providerRegistry) exists in the cache but has not yet been
+	// restored.
+	hasUnrestoredProvider []bool
 	// Whether this module support incremental build.
 	incrementalSupported bool
 	providerRestoreLock  sync.Mutex
@@ -3587,8 +3590,7 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 						Value: &p,
 					})
 			}
-			if err := c.buildActionsCache.writeProviders(c.EncContext, info.buildActionCacheKey,
-				&ProviderCachedData{Providers: providers}); err != nil {
+			if err := c.buildActionsCache.writeProviders(c.EncContext, info.buildActionCacheKey, providers); err != nil {
 				panic(err)
 			}
 		}
@@ -3626,6 +3628,8 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 				// This logic here assumes a singleton's behavior is a pure function of its providers.
 				// Conditional access to certain providers must also be based on other provider
 				// values, ensuring that any behavioral change is captured by the input providers hashes.
+				// When a incremental doesn't have any cached provider, it means the input of the singleton
+				// was not captured or it doesn't depend on any input, so we always run it.
 				info.incrementalRestored = len(data.ProviderHashes) != 0
 				for k, v := range data.ProviderHashes {
 					if c.providerValueHashes[k] != v {
@@ -4556,7 +4560,7 @@ func (c *Context) VerifyProvidersWereUnchanged() []error {
 				if m.providerInitialValueHashes[i] != hash {
 					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
 				}
-			} else if m.providerInitialValueHashes[i] != 0 {
+			} else if m.providerInitialValueHashes[i] != 0 && !m.hasUnrestoredProvider[i] {
 				// This should be unreachable, because in setProvider we check if the provider has already been set.
 				errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
 			}
@@ -4881,13 +4885,8 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	defer c.EndEvent("modules")
 
 	var modules []*moduleInfo
-	var incModules []*moduleInfo
 
 	for module := range c.iterateAllVariants() {
-		if module.incrementalSupported {
-			incModules = append(incModules, module)
-			continue
-		}
 		modules = append(modules, module)
 	}
 
@@ -4907,9 +4906,8 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	}
 
 	slices.SortFunc(modules, cachedNameModuleLess)
-	slices.SortFunc(incModules, cachedNameModuleLess)
 
-	phonys := c.deduplicateOrderOnlyDeps(append(modules, incModules...))
+	phonys := c.deduplicateOrderOnlyDeps(modules)
 
 	c.EventHandler.Do("sort_phony_builddefs", func() {
 		// sorting for determinism, the phony output names are stable
@@ -4957,7 +4955,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 					}
 				}()
 				writer := newNinjaWriter(buf)
-				err = c.writeModuleAction(batchModules, writer, headerTemplate)
+				err = c.writeIncrementalModules(batchModules, writer, headerTemplate)
 				if err != nil {
 					errorCh <- err
 				}
@@ -4965,26 +4963,13 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 			nw.Subninja(file)
 		}
 
-		suffix := ".ninja"
-		base := strings.TrimSuffix(ninjaFileName, suffix)
-		file := fmt.Sprintf("%s.incremental%s", base, suffix)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := writeIncrementalModules(c, file, incModules, headerTemplate)
-			if err != nil {
-				errorCh <- err
-			}
-		}()
-		nw.Subninja(file)
-
 		if c.GetIncrementalEnabled() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				parallelVisitSimple(slices.Values(incModules), parallelVisitLimit,
+				parallelVisitSimple(slices.Values(modules), parallelVisitLimit,
 					func(m *moduleInfo, _ int) []error {
-						if !m.incrementalRestored {
+						if m.incrementalSupported && !m.incrementalRestored {
 							c.cacheModuleBuildActions(m)
 						}
 						return nil
@@ -4998,7 +4983,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 		}()
 
 		if c.incrementalDebugFile != "" {
-			c.WriteIncrementalDebugInfo(c.incrementalDebugFile, incModules)
+			c.WriteIncrementalDebugInfo(c.incrementalDebugFile, modules)
 		}
 
 		var errors []error
@@ -5055,19 +5040,7 @@ func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func
 	}
 	return errors
 }
-
-func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
-	c.BeginEvent("write_incremental_modules")
-	defer c.EndEvent("write_incremental_modules")
-	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
-	if err != nil {
-		return err
-	}
-	defer bf.Close()
-	baseBuf := bufio.NewWriterSize(bf, 16*1024*1024)
-	defer baseBuf.Flush()
-	baseWriter := newNinjaWriter(baseBuf)
-
+func (c *Context) writeIncrementalModules(modules []*moduleInfo, baseWriter *ninjaWriter, headerTemplate *template.Template) error {
 	// Use a sync.Pool to reuse buffers and reduce memory allocations.
 	bufferPool := sync.Pool{
 		New: func() any {
@@ -5104,8 +5077,8 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
 			if err == nil {
 				// Make a copy of the bytes, as the buffer will be reused.
 				moduleBytes = slices.Clone(inMemoryWriter.Bytes())
-				// Write the newly generated statements back to the cache when in incremental mode.
-				if c.GetIncrementalEnabled() {
+				// Write the newly generated statements back to the cache for incremental module.
+				if m.buildActionCacheKey != nil {
 					err = c.buildActionsCache.writeNinjaStatements(m.buildActionCacheKey, moduleBytes)
 				}
 			}
@@ -5367,12 +5340,8 @@ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 		GlobCache:        module.globCache,
 	}
 
-	providersData := ProviderCachedData{
-		Providers: providers,
-	}
-
 	err := errors.Join(c.buildActionsCache.writeModuleBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData),
-		c.buildActionsCache.writeProviders(c.EncContext, module.buildActionCacheKey, &providersData))
+		c.buildActionsCache.writeProviders(c.EncContext, module.buildActionCacheKey, providers))
 	if err != nil {
 		panic(err)
 	}
