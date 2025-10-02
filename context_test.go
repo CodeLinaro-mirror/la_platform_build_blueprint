@@ -1632,12 +1632,10 @@ func incrementalSetupForRestore(ctx *Context, orderOnlyStrings []string) any {
 		OrderOnlyStrings: orderOnlyStrings,
 		GlobCache:        calculateGlobCache(),
 	})
-	ctx.buildActionsCache.writeProviders(ctx.EncContext, &cacheKey, &ProviderCachedData{
-		Providers: []CachedProvider{{
-			Id:    &IncrementalTestProviderKey.providerKey,
-			Value: &providerValue,
-		}},
-	})
+	ctx.buildActionsCache.writeProviders(ctx.EncContext, &cacheKey, []CachedProvider{{
+		Id:    &IncrementalTestProviderKey.providerKey,
+		Value: &providerValue,
+	}})
 	ctx.buildActionsCache.writeNinjaStatements(&cacheKey, []byte(incrementalModuleNinja))
 	ctx.SetIncrementalEnabled(true)
 	ctx.SetIncrementalAnalysis(true)
@@ -1725,21 +1723,15 @@ func TestCacheBuildActions(t *testing.T) {
 		t.Errorf("expected: %v actual %v", expectedCache, *cache)
 	}
 
-	providers, err := ctx.buildActionsCache.readProviders(ctx.EncContext, &cacheKey)
+	provider, err := ctx.buildActionsCache.readProvider(ctx.EncContext, &cacheKey, &IncrementalTestProviderKey.providerKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
-	if providers == nil {
-		t.Errorf("failed to find cached build actions for the incremental module")
+	if *provider.Id != IncrementalTestProviderKey.providerKey {
+		t.Errorf("expected restored id: %v actual %v", IncrementalTestProviderKey.providerKey, *provider.Id)
 	}
-	expectedProviders := ProviderCachedData{
-		Providers: []CachedProvider{{
-			Id:    &IncrementalTestProviderKey.providerKey,
-			Value: &providerValue,
-		}},
-	}
-	if !reflect.DeepEqual(expectedProviders, *providers) {
-		t.Errorf("expected: %v actual %v", expectedProviders, *providers)
+	if !reflect.DeepEqual(*provider.Value, providerValue) {
+		t.Errorf("expected: %v actual %v", providerValue, *provider.Value)
 	}
 
 	ninja, err := ctx.buildActionsCache.readNinjaStatements(&cacheKey)
@@ -1834,7 +1826,7 @@ func TestSkipNinjaForCacheHit(t *testing.T) {
 		t.Errorf("ninja file doesn't have build statements for MyBarModule: %s", string(content))
 	}
 
-	file, err = ctx.fs.Open("test.incremental.ninja")
+	file, err = ctx.fs.Open("test.2.ninja")
 	if err != nil {
 		t.Errorf("no ninja file for MyIncrementalModule")
 	}
@@ -1873,7 +1865,7 @@ func TestNotSkipNinjaForCacheMiss(t *testing.T) {
 		t.Errorf("ninja file doesn't have build statements for MyBarModule: %s", string(content))
 	}
 
-	file, err = ctx.fs.Open("test.incremental.ninja")
+	file, err = ctx.fs.Open("test.2.ninja")
 	if err != nil {
 		t.Errorf("no ninja file for MyIncrementalModule")
 	}
@@ -2381,6 +2373,8 @@ func TestSingletonCache(t *testing.T) {
 		t.Errorf("expected GenerateBuildActions to be called once, got %d", sequentialSingleton{}.GenerateBuildActionsCalled)
 	}
 
+	ctx.buildActionsCache.flush()
+
 	// 2. Verify cache entry was written
 	seqCacheKey := &BuildActionCacheKey{Id: sequentialSingletonName}
 	data, err := ctx.buildActionsCache.readSingletonBuildAction(ctx.EncContext, seqCacheKey)
@@ -2392,22 +2386,16 @@ func TestSingletonCache(t *testing.T) {
 	}
 
 	// 3. Verify providers were cached
-	providers, err := ctx.buildActionsCache.readProviders(ctx.EncContext, seqCacheKey)
+	provider, err := ctx.buildActionsCache.readProvider(ctx.EncContext, seqCacheKey, &singletonTestInfoProvider.providerKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
-	if providers == nil {
-		t.Errorf("failed to find cached build actions for singleton")
+	if *provider.Id != singletonTestInfoProvider.providerKey {
+		t.Errorf("expected restored id: %v actual %v", IncrementalTestProviderKey.providerKey, *provider.Id)
 	}
 	var providerValue any = IncrementalTestInfo{Value: sequentialSingletonName}
-	expectedProviders := ProviderCachedData{
-		Providers: []CachedProvider{{
-			Id:    &singletonTestInfoProvider.providerKey,
-			Value: &providerValue,
-		}},
-	}
-	if !reflect.DeepEqual(expectedProviders, *providers) {
-		t.Errorf("expected: %v actual %v", expectedProviders, *providers)
+	if !reflect.DeepEqual(*provider.Value, providerValue) {
+		t.Errorf("expected: %v actual %v", providerValue, *provider.Value)
 	}
 
 	// 4. Verify ninja statement was cached
@@ -2442,6 +2430,8 @@ func TestSingletonRestore(t *testing.T) {
 		t.Fatalf("failed to write all singleton actions: %v", err)
 	}
 
+	ctx.buildActionsCache.flush()
+
 	cacheKey := &BuildActionCacheKey{Id: sequentialSingletonName}
 	data, err := ctx.buildActionsCache.readSingletonBuildAction(ctx.EncContext, cacheKey)
 	if err != nil {
@@ -2451,16 +2441,18 @@ func TestSingletonRestore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read ninja statements: %v", err)
 	}
-	providers, err := ctx.buildActionsCache.readProviders(ctx.EncContext, cacheKey)
+	provider, err := ctx.buildActionsCache.readProvider(ctx.EncContext, cacheKey, &singletonTestInfoProvider.providerKey)
 	if err != nil {
-		t.Fatalf("failed to read providers: %v", err)
+		t.Fatalf("failed to read provider: %v", err)
 	}
 
 	// Now simulate an incremental build
 	ctx = singletonCacheSetup(t)
 	ctx.buildActionsCache.writeSingletonBuildAction(ctx.EncContext, cacheKey, data)
 	ctx.buildActionsCache.writeNinjaStatements(cacheKey, ninja)
-	ctx.buildActionsCache.writeProviders(ctx.EncContext, cacheKey, providers)
+	ctx.buildActionsCache.writeProviders(ctx.EncContext, cacheKey, []CachedProvider{provider})
+
+	ctx.buildActionsCache.flush()
 
 	_, errs = ctx.PrepareBuildActions(nil)
 	if len(errs) > 0 {

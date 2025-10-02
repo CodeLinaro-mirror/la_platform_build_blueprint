@@ -116,6 +116,20 @@ func NewMutatorProvider[K any](mutator string) ProviderKey[K] {
 	return provider
 }
 
+func ProviderType(id int) string {
+	if id >= 0 && id < len(providerRegistry) {
+		return providerRegistry[id].typ
+	}
+	return "unknown"
+}
+
+func ProviderMutator(id int) string {
+	if id >= 0 && id < len(providerRegistry) {
+		return providerRegistry[id].mutator
+	}
+	return "unknown"
+}
+
 // initProviders fills c.providerMutators with the *mutatorInfo associated with each provider ID,
 // if any.
 func (c *Context) initProviders() {
@@ -265,25 +279,27 @@ func maybeRestoreProviders(c *Context, m *commonIncrementalInfo, provider *provi
 		return
 	}
 
-	if m.incrementalRestored && !m.providersRestored {
+	if m.incrementalRestored && (m.hasUnrestoredProvider == nil || m.hasUnrestoredProvider[provider.id]) {
 		func() {
 			m.providerRestoreLock.Lock()
 			defer m.providerRestoreLock.Unlock()
-			if !m.providersRestored {
-				providers, err := c.buildActionsCache.readProviders(c.EncContext, m.buildActionCacheKey)
+			if m.hasUnrestoredProvider == nil || m.hasUnrestoredProvider[provider.id] {
+				p, err := c.buildActionsCache.readProvider(c.EncContext, m.buildActionCacheKey, provider)
 				if err != nil {
 					panic(err)
 				}
 				if m.providers == nil {
 					m.providers = make([]any, len(providerRegistry))
 				}
-				for _, provider := range providers.Providers {
-					if m.providers[provider.Id.id] != nil {
-						panic(fmt.Sprintf("Value of provider %s is already set", provider.Id.typ))
-					}
-					m.providers[provider.Id.id] = *provider.Value
+				if m.providers[provider.id] != nil {
+					panic(fmt.Sprintf("Value of provider %s is already set", provider.typ))
 				}
-				m.providersRestored = true
+				if p.Value != nil {
+					m.providers[provider.id] = *p.Value
+				}
+				if m.hasUnrestoredProvider != nil {
+					m.hasUnrestoredProvider[provider.id] = false
+				}
 			}
 		}()
 	}
