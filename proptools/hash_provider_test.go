@@ -1,11 +1,15 @@
 package proptools
 
 import (
+	"slices"
 	"strings"
 	"testing"
+	"text/scanner"
+
+	"github.com/google/blueprint/parser"
 )
 
-func mustHash(t *testing.T, data interface{}) uint64 {
+func mustHash(t *testing.T, data interface{}) Hash {
 	t.Helper()
 	result, err := CalculateHash(data)
 	if err != nil {
@@ -238,6 +242,19 @@ func TestHashingDuplicatePointers(t *testing.T) {
 
 }
 
+func TestHashBytes(t *testing.T) {
+	hash := Hash{0x1234567890ABCDEF}
+	bytes := hash.Bytes()
+	if len(bytes) != HashSize {
+		t.Fatalf("Expected %d bytes, got %d", HashSize, len(bytes))
+	}
+
+	expected := []byte{0xef, 0xcd, 0xab, 0x90, 0x78, 0x56, 0x34, 0x12}
+	if !slices.Equal(bytes, expected) {
+		t.Fatalf("Expected %#v, got %#v", expected, bytes)
+	}
+}
+
 func BenchmarkCalculateHash(b *testing.B) {
 	for _, testCase := range hashTestCases {
 		b.Run(testCase.name, func(b *testing.B) {
@@ -249,5 +266,26 @@ func BenchmarkCalculateHash(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestHashCalculationExcludePosition(t *testing.T) {
+	instance1 := &parser.String{
+		LiteralPos: scanner.Position{
+			Line: 10,
+		},
+		Value: "-Wall",
+	}
+	instance2 := &parser.String{
+		LiteralPos: scanner.Position{
+			Line: 20,
+		},
+		Value: "-Wall",
+	}
+
+	hash1, _ := CalculateHash(instance1)
+	hash2, _ := CalculateHash(instance2)
+	if hash1 != hash2 {
+		t.Fatalf("Expect hash values to be equal: %d %d", hash1, hash2)
 	}
 }
