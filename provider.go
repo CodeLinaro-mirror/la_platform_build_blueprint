@@ -184,6 +184,7 @@ func (c *Context) setProvider(m *moduleInfo, provider *providerKey, value any) {
 // provider(type T)(m *moduleInfo, provider ProviderKey(T)) T
 func (c *Context) provider(m *moduleInfo, provider *providerKey) (any, bool) {
 	validateProvider(c, m, provider)
+	maybeRestoreProviders(c, m, provider)
 	if len(m.providers) > provider.id {
 		if p := m.providers[provider.id]; p != nil {
 			return p, true
@@ -195,6 +196,7 @@ func (c *Context) provider(m *moduleInfo, provider *providerKey) (any, bool) {
 
 func (c *Context) hasProvider(m *moduleInfo, provider *providerKey) bool {
 	validateProvider(c, m, provider)
+	maybeRestoreProviders(c, m, provider)
 	if len(m.providers) > provider.id {
 		if p := m.providers[provider.id]; p != nil {
 			return true
@@ -202,6 +204,35 @@ func (c *Context) hasProvider(m *moduleInfo, provider *providerKey) bool {
 	}
 
 	return false
+}
+
+func maybeRestoreProviders(c *Context, m *moduleInfo, provider *providerKey) {
+	if provider.mutator != "" {
+		return
+	}
+
+	if m.incrementalRestored && !m.providersRestored {
+		func() {
+			m.providerRestoreLock.Lock()
+			defer m.providerRestoreLock.Unlock()
+			if !m.providersRestored {
+				providers, err := c.buildActionsCache.readProviders(c.EncContext, m.buildActionCacheKey)
+				if err != nil {
+					panic(err)
+				}
+				if m.providers == nil {
+					m.providers = make([]any, len(providerRegistry))
+				}
+				for _, provider := range providers.Providers {
+					if m.providers[provider.Id.id] != nil {
+						panic(fmt.Sprintf("Value of provider %s is already set", provider.Id.typ))
+					}
+					m.providers[provider.Id.id] = *provider.Value
+				}
+				m.providersRestored = true
+			}
+		}()
+	}
 }
 
 func validateProvider(c *Context, m *moduleInfo, provider *providerKey) {

@@ -35,6 +35,7 @@ license {
 bootstrap_go_package {
     name: "blueprint",
     deps: [
+        "blueprint-dbtools",
         "blueprint-gobtools",
         "blueprint-metrics",
         "blueprint-parser",
@@ -43,6 +44,7 @@ bootstrap_go_package {
         "blueprint-proptools",
         "blueprint-syncmap",
         "blueprint-uniquelist",
+        "pogreb",
     ],
     pkgPath: "github.com/google/blueprint",
     srcs: [
@@ -204,6 +206,7 @@ bootstrap_go_package {
         "blueprint",
         "blueprint-deptools",
         "blueprint-pathtools",
+        "blueprint-proptools",
         "blueprint-bootstrap-bpdoc",
     ],
     pkgPath: "github.com/google/blueprint/bootstrap",
@@ -212,6 +215,9 @@ bootstrap_go_package {
         "bootstrap/command.go",
         "bootstrap/config.go",
         "bootstrap/writedocs.go",
+    ],
+    testSrcs: [
+        "bootstrap/bootstrap_test.go",
     ],
 }
 

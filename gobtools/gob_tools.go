@@ -21,38 +21,10 @@ import (
 	"io"
 	"reflect"
 
+	"github.com/google/blueprint/dbtools"
 	"github.com/google/blueprint/proptools"
 	"github.com/google/blueprint/syncmap"
 )
-
-const dbName = "references.db"
-
-type KeyValueStore interface {
-	Put(key []byte, value []byte) error
-	Get(key []byte) ([]byte, error)
-	Close() error
-}
-
-type InMemKeyValueStore struct {
-	data syncmap.SyncMap[string, []byte]
-}
-
-func (s *InMemKeyValueStore) Close() error {
-	return nil
-}
-
-func (s *InMemKeyValueStore) Put(key []byte, value []byte) error {
-	s.data.LoadOrStore(string(key), value)
-	return nil
-}
-
-func (s *InMemKeyValueStore) Get(key []byte) ([]byte, error) {
-	if ret, ok := s.data.Load(string(key)); !ok {
-		return nil, nil
-	} else {
-		return ret, nil
-	}
-}
 
 type EncContext interface {
 	ReferenceEnc
@@ -64,26 +36,28 @@ type ReferenceEnc interface {
 	DecodeReference(buf *bytes.Reader, decode func(buf *bytes.Reader) (any, error)) (any, error)
 }
 
-func NewCodecContext(dbPath string) EncContext {
-	return NewReferencesEncoder(dbPath)
+func NewEncContext(db dbtools.KeyValueStore) EncContext {
+	return NewReferencesEncoder(db)
 }
 
 type ReferencesEncoder struct {
 	encodedReferences syncmap.SyncMap[any, *encodedReference]
 	decodedReferences syncmap.SyncMap[uint64, any]
-	db                KeyValueStore
+	db                dbtools.KeyValueStore
 }
 
 // NewReferencesEncoder creates and initializes a new ReferencesEncoder.
-func NewReferencesEncoder(dbPath string) *ReferencesEncoder {
-	ctx := &ReferencesEncoder{}
-	ctx.open(dbPath)
+func NewReferencesEncoder(db dbtools.KeyValueStore) *ReferencesEncoder {
+	ctx := &ReferencesEncoder{
+		db: db,
+	}
 	return ctx
 }
 
 func NewReferencesEncoderForTest() *ReferencesEncoder {
-	ctx := &ReferencesEncoder{}
-	ctx.openForTests()
+	ctx := &ReferencesEncoder{
+		db: &dbtools.InMemKeyValueStore{},
+	}
 	return ctx
 }
 
@@ -98,24 +72,8 @@ func (b *ReferencesEncoder) openForTests() error {
 		panic(fmt.Errorf("db is already open"))
 	}
 
-	b.db = &InMemKeyValueStore{}
+	b.db = &dbtools.InMemKeyValueStore{}
 	return nil
-}
-
-func (b *ReferencesEncoder) open(dbPath string) error {
-	// Uncomment the code below once we support pogreb.
-	/*
-		if b.db != nil {
-			panic(fmt.Errorf("db is already open"))
-		}
-		db, err := pogreb.Open(filepath.Join(dbPath, dbName), nil)
-		if err != nil {
-			return err
-		}
-		b.db = db
-		return nil
-	*/
-	panic(fmt.Errorf("db support is not ready yet"))
 }
 
 func (c *ReferencesEncoder) EncodeReferences() error {

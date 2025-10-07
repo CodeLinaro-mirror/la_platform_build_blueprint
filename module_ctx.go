@@ -168,6 +168,10 @@ func (m ModuleProxy) IsNil() bool {
 	return m.moduleInfo == nil
 }
 
+func (m ModuleProxy) IncrementalInfo() (bool, bool) {
+	return m.moduleInfo.incrementalSupported, m.moduleInfo.incrementalRestored
+}
+
 func (m ModuleProxy) Name() string {
 	if m.moduleInfo.logicModule == nil {
 		return m.moduleInfo.cachedName
@@ -350,7 +354,7 @@ type BaseModuleContext interface {
 	// order by mutators and GenerateBuildActions, so the data created by the current mutator can be read from the
 	// Module returned by PrimaryModule without data races.  This can be used to perform singleton actions that are
 	// only done once for all variants of a module.
-	IsPrimaryModule(module ModuleOrProxy) bool
+	IsPrimaryModule() bool
 
 	// FinalModule returns the last variant of the current module.  Variants of a module are always visited in
 	// order by mutators and GenerateBuildActions, so the data created by the current mutator can be read from all
@@ -362,7 +366,7 @@ type BaseModuleContext interface {
 	// order by mutators and GenerateBuildActions, so the data created by the current mutator can be read from all
 	// variants using VisitAllModuleVariants if the current module is the last one.  This can be used to perform
 	// singleton actions that are only done once for all variants of a module.
-	IsFinalModule(module ModuleOrProxy) bool
+	IsFinalModule() bool
 
 	// OtherModuleName returns the name of another Module.  See BaseModuleContext.ModuleName for more information.
 	// It is intended for use inside the visit functions of Visit* and WalkDeps.
@@ -763,21 +767,19 @@ func (m *baseModuleContext) SetProvider(provider AnyProviderKey, value interface
 }
 
 func (m *moduleContext) restoreModuleBuildActions() bool {
-	// Whether the incremental flag is set and the module type supports
-	// incremental, this will decide weather to cache the data for the module.
-	incrementalEnabled := false
 	// Whether the above conditions are true and we can try to restore from
 	// the cache for this module, i.e., no env, product variables and Soong
 	// code changes.
 	incrementalAnalysis := false
 	var cacheKey *BuildActionCacheKey = nil
-	if m.context.GetIncrementalEnabled() {
-		if im, ok := m.module.logicModule.(Incremental); ok {
-			incrementalEnabled = im.IncrementalSupported()
-			incrementalAnalysis = m.context.GetIncrementalAnalysis() && incrementalEnabled
-		}
+	if im, ok := m.module.logicModule.(Incremental); ok {
+		m.module.incrementalSupported = im.IncrementalSupported()
 	}
-	if incrementalEnabled {
+
+	// Whether the incremental flag is set and the module type supports
+	// incremental, this will decide weather to cache the data for the module.
+	if m.context.GetIncrementalEnabled() && m.module.incrementalSupported {
+		incrementalAnalysis = m.context.GetIncrementalAnalysis()
 		hash, err := proptools.CalculateHash(m.module.properties)
 		if err != nil {
 			panic(newPanicErrorf(err, "failed to calculate properties hash"))
@@ -806,10 +808,12 @@ func (m *moduleContext) restoreModuleBuildActions() bool {
 		}
 	}
 
-	restored := false
-	if incrementalAnalysis && cacheKey != nil {
+	if incrementalAnalysis {
 		// Try to restore from cache if there is a cache hit
-		data := m.context.getBuildActionsFromCache(cacheKey)
+		data, err := m.context.buildActionsCache.readBuildAction(m.context.EncContext, cacheKey)
+		if err != nil {
+			panic(err)
+		}
 		if data == nil || m.module.buildActionInputHash != data.InputHash {
 			return false
 		}
@@ -827,13 +831,21 @@ func (m *moduleContext) restoreModuleBuildActions() bool {
 			}
 		}
 
-		for _, provider := range data.Providers {
-			m.context.setProvider(m.module, provider.Id, *provider.Value)
+		if m.module.providerInitialValueHashes == nil {
+			m.module.providerInitialValueHashes = make([]uint64, len(providerRegistry))
 		}
+
 		m.module.incrementalRestored = true
+
+		for _, provider := range data.ProviderHashes {
+			m.module.providerInitialValueHashes[provider.Id.id] = provider.Hash
+			// We need to restore all the providers before we cache singletons, so do
+			// it here so the work can be run more in parallel.
+			maybeRestoreProviders(m.context, m.module, provider.Id)
+		}
+
 		m.module.orderOnlyStrings = data.OrderOnlyStrings
 		m.module.globCache = data.GlobCache
-		restored = true
 		for _, str := range data.OrderOnlyStrings {
 			if !strings.HasPrefix(str, "dedup-") {
 				continue
@@ -863,7 +875,7 @@ func (m *moduleContext) restoreModuleBuildActions() bool {
 		}
 	}
 
-	return restored
+	return m.module.incrementalRestored
 }
 
 type depProviders struct {
@@ -1079,16 +1091,16 @@ func (m *baseModuleContext) PrimaryModule() Module {
 	return m.module.group.modules.firstModule().logicModule
 }
 
-func (m *baseModuleContext) IsPrimaryModule(module ModuleOrProxy) bool {
-	return m.module.group.modules.firstModule() == module.info()
+func (m *baseModuleContext) IsPrimaryModule() bool {
+	return m.module.group.modules.firstModule() == m.module
 }
 
 func (m *baseModuleContext) FinalModule() Module {
 	return m.module.group.modules.lastModule().logicModule
 }
 
-func (m *baseModuleContext) IsFinalModule(module ModuleOrProxy) bool {
-	return m.module.group.modules.lastModule() == module.info()
+func (m *baseModuleContext) IsFinalModule() bool {
+	return m.module.group.modules.lastModule() == m.module
 }
 
 func (m *baseModuleContext) AddNinjaFileDeps(deps ...string) {
@@ -1151,6 +1163,13 @@ func (m *moduleContext) Rule(pctx PackageContext, name string,
 
 func (m *moduleContext) Build(pctx PackageContext, params BuildParams) {
 	m.scope.ReparentTo(pctx)
+
+	if m.context.captureBuildParams {
+		if m.module.buildParams == nil {
+			m.module.buildParams = &[]BuildParams{}
+		}
+		*m.module.buildParams = append(*m.module.buildParams, params)
+	}
 
 	def, err := parseBuildParams(m.scope, &params, m.ModuleTags())
 	if err != nil {

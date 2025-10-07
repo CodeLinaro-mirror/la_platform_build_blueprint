@@ -142,10 +142,10 @@ type Context struct {
 	globs    map[globKey]pathtools.GlobResult
 	globLock sync.Mutex
 
-	srcDir         string
-	soongOutDir    string
-	fs             pathtools.FileSystem
-	moduleListFile string
+	srcDir           string
+	incrementalDBDir string
+	fs               pathtools.FileSystem
+	moduleListFile   string
 
 	// Mutators indexed by the ID of the provider associated with them.  Not all mutators will
 	// have providers, and not all providers will have a mutator, or if they do the mutator may
@@ -185,9 +185,11 @@ type Context struct {
 	orderOnlyStringsCache   OrderOnlyStringsCache
 	orderOnlyStrings        syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
 	incrementalDebugFile    string
-	CodecContext            gobtools.EncContext
+	EncContext              gobtools.EncContext
 
 	moduleDebugDataChannel chan []byte
+
+	captureBuildParams bool
 }
 
 type orderOnlyStringsInfo struct {
@@ -396,7 +398,8 @@ type moduleInfo struct {
 	outgoingTransitionCache [][]string
 
 	// set during PrepareBuildActions
-	actionDefs localBuildActions
+	actionDefs  localBuildActions
+	buildParams *[]BuildParams
 
 	providers                  []interface{}
 	providerInitialValueHashes []uint64
@@ -427,7 +430,11 @@ type globResultCache struct {
 }
 
 type incrementalInfo struct {
-	incrementalRestored  bool
+	incrementalRestored bool
+	providersRestored   bool
+	// Whether this module support incremental build.
+	incrementalSupported bool
+	providerRestoreLock  sync.Mutex
 	buildActionCacheKey  *BuildActionCacheKey
 	buildActionInputHash uint64
 	orderOnlyStrings     []string
@@ -771,37 +778,20 @@ func (c *Context) SetIncrementalDebugFile(file string) {
 	c.incrementalDebugFile = file
 }
 
-func (c *Context) updateBuildActionsCache(key *BuildActionCacheKey, data *BuildActionCachedData) {
-	if key != nil {
-		err := c.buildActionsCache.write(c.CodecContext, key, data)
-		if err != nil {
-			panic(err)
-		}
-	}
-}
-
-func (c *Context) getBuildActionsFromCache(key *BuildActionCacheKey) *BuildActionCachedData {
-	if c.buildActionsCache != nil && key != nil {
-		v, err := c.buildActionsCache.read(c.CodecContext, key)
-		if err != nil {
-			panic(err)
-		}
-		return v
-	}
-	return nil
-}
-
-func (c *Context) CacheAllBuildActions(soongOutDir string) error {
-	c.buildActionsCache.db.Close()
+func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
 	if err := cacheEncData(c, soongOutDir, OrderOnlyStringsCacheFile, &c.orderOnlyStringsCache); err != nil {
 		return err
 	}
-	return c.CodecContext.EncodeReferences()
+	defer func() {
+		err = errors.Join(err, c.buildActionsCache.close())
+	}()
+	err = c.EncContext.EncodeReferences()
+	return err
 }
 
 func cacheEncData(ctx *Context, soongOutDir string, fileName string, data gobtools.CustomEnc) error {
 	buf := new(bytes.Buffer)
-	if err := data.Encode(ctx.CodecContext, buf); err != nil {
+	if err := data.Encode(ctx.EncContext, buf); err != nil {
 		return err
 	}
 	return writeToCache(ctx, soongOutDir, fileName, buf)
@@ -825,7 +815,7 @@ func (c *Context) RestoreAllBuildActions(soongOutDir string) error {
 
 func restoreEncData(ctx *Context, soongOutDir string, fileName string, data gobtools.CustomDec) error {
 	if stream, err := restoreFromCache(ctx, soongOutDir, fileName); err == nil && stream != nil {
-		return data.Decode(ctx.CodecContext, bytes.NewReader(stream))
+		return data.Decode(ctx.EncContext, bytes.NewReader(stream))
 	} else {
 		return err
 	}
@@ -847,6 +837,14 @@ func (c *Context) SetSrcDir(path string) {
 
 func (c *Context) SrcDir() string {
 	return c.srcDir
+}
+
+func (c *Context) SetIncrementalDBDir(path string) {
+	c.incrementalDBDir = path
+}
+
+func (c *Context) IncrementalDBDir() string {
+	return c.incrementalDBDir
 }
 
 func singletonPkgPath(singleton Singleton) string {
@@ -2729,15 +2727,24 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 				checking[module] = true
 				defer delete(checking, module)
 
-				var cycle []*moduleInfo
-				for _, dep := range order.propagate(module) {
-					cycle = check(dep)
-					if cycle != nil {
-						break
+				// Create an iterator that yields the existing dependencies of this module (via order.propagate),
+				// followed by any newly added dependencies stored in pauseMap.
+				dependencyIter := func(yield func(*moduleInfo) bool) {
+					for _, dep := range order.propagate(module) {
+						if !yield(dep) {
+							return
+						}
+					}
+					for _, pauseSpec := range pauseMap[module] {
+						if !yield(pauseSpec.paused) {
+							return
+						}
 					}
 				}
-				for _, pauseSpec := range pauseMap[module] {
-					cycle = check(pauseSpec.paused)
+
+				var cycle []*moduleInfo
+				for dep := range dependencyIter {
+					cycle = check(dep)
 					if cycle != nil {
 						break
 					}
@@ -2923,11 +2930,17 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		if c.GetIncrementalEnabled() {
 			if c.buildActionsCache == nil {
 				c.buildActionsCache = &BuildActionCache{}
-				err := c.buildActionsCache.open(JoinPath(c.SrcDir(), "incremental.db"))
-				if err != nil {
+				dbPath := filepath.Join(c.SrcDir(), c.IncrementalDBDir())
+				// Remove all the cached data from the key-value store for a full build.
+				if !c.GetIncrementalAnalysis() {
+					if err := c.buildActionsCache.reset(c, dbPath); err != nil {
+						panic(fmt.Errorf("error resetting incremental db: %w", err))
+					}
+				}
+				if err := c.buildActionsCache.open(dbPath); err != nil {
 					panic(fmt.Errorf("error opening incremental db: %w", err))
 				}
-				c.CodecContext = gobtools.NewCodecContext(c.SrcDir())
+				c.EncContext = gobtools.NewEncContext(c.buildActionsCache.referencesDb)
 			}
 
 			for _, p := range packageContexts {
@@ -3263,7 +3276,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 	// Add in any new reverse dependencies that were added by the mutator
 	for module, deps := range reverseDeps {
-		sort.Sort(depSorter(deps))
+		sort.Sort(depSorter{deps, c.nameInterface})
 		module.directDeps = append(module.directDeps, deps...)
 		for _, dep := range deps {
 			module.forwardDeps = append(module.forwardDeps, dep.module)
@@ -4335,6 +4348,17 @@ func (c *Context) ModuleToProxy(module ModuleOrProxy) ModuleProxy {
 	return ModuleProxy{module.info()}
 }
 
+func (c *Context) CaptureBuildParams() {
+	c.captureBuildParams = true
+}
+
+func (c *Context) BuildParamsForModule(module ModuleOrProxy) []BuildParams {
+	if p := module.info().buildParams; p != nil {
+		return *p
+	}
+	return nil
+}
+
 // Singletons returns a list of all registered Singletons.
 func (c *Context) Singletons() []Singleton {
 	var ret []Singleton
@@ -4669,24 +4693,21 @@ func (c *Context) writeGlobalRules(nw *ninjaWriter) error {
 	return nil
 }
 
-type depSorter []depInfo
+type depSorter struct {
+	deps          []depInfo
+	nameInterface NameInterface
+}
 
 func (s depSorter) Len() int {
-	return len(s)
+	return len(s.deps)
 }
 
 func (s depSorter) Less(i, j int) bool {
-	iName := s[i].module.Name()
-	jName := s[j].module.Name()
-	if iName == jName {
-		iName = s[i].module.variant.name
-		jName = s[j].module.variant.name
-	}
-	return iName < jName
+	return moduleLess(s.deps[i].module, s.deps[j].module, s.nameInterface)
 }
 
 func (s depSorter) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
+	s.deps[i], s.deps[j] = s.deps[j], s.deps[i]
 }
 
 type moduleSorter struct {
@@ -4699,13 +4720,15 @@ func (s moduleSorter) Len() int {
 }
 
 func (s moduleSorter) Less(i, j int) bool {
-	iMod := s.modules[i]
-	jMod := s.modules[j]
-	iName := s.nameInterface.UniqueName(newNamespaceContext(iMod), iMod.group.name)
-	jName := s.nameInterface.UniqueName(newNamespaceContext(jMod), jMod.group.name)
+	return moduleLess(s.modules[i], s.modules[j], s.nameInterface)
+}
+
+func moduleLess(iMod, jMod *moduleInfo, nameInterface NameInterface) bool {
+	iName := nameInterface.UniqueName(newNamespaceContext(iMod), iMod.group.name)
+	jName := nameInterface.UniqueName(newNamespaceContext(jMod), jMod.group.name)
 	if iName == jName {
-		iVariantName := s.modules[i].variant.name
-		jVariantName := s.modules[j].variant.name
+		iVariantName := iMod.variant.name
+		jVariantName := jMod.variant.name
 		if iVariantName == jVariantName {
 			panic(fmt.Sprintf("duplicate module name: %s %s: %#v and %#v\n",
 				iName, iVariantName, iMod.variant.variations, jMod.variant.variations))
@@ -4744,7 +4767,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	var incModules []*moduleInfo
 
 	for module := range c.iterateAllVariants() {
-		if module.buildActionCacheKey != nil {
+		if module.incrementalSupported {
 			incModules = append(incModules, module)
 			continue
 		}
@@ -4809,19 +4832,31 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 			nw.Subninja(file)
 		}
 
+		suffix := ".ninja"
+		base := strings.TrimSuffix(ninjaFileName, suffix)
+		file := fmt.Sprintf("%s.incremental%s", base, suffix)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := writeIncrementalModules(c, file, incModules, headerTemplate)
+			if err != nil {
+				errorCh <- err
+			}
+		}()
+		nw.Subninja(file)
+
 		if c.GetIncrementalEnabled() {
-			suffix := ".ninja"
-			base := strings.TrimSuffix(ninjaFileName, suffix)
-			file := fmt.Sprintf("%s.incremental%s", base, suffix)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err := writeIncrementalModules(c, file, incModules, headerTemplate)
-				if err != nil {
-					errorCh <- err
-				}
+				parallelVisit(slices.Values(incModules), unorderedVisitorImpl{}, parallelVisitLimit,
+					func(m *moduleInfo, pause pauseFunc) bool {
+						if !m.incrementalRestored {
+							c.cacheModuleBuildActions(m)
+						}
+						return false
+					})
 			}()
-			nw.Subninja(file)
 		}
 
 		go func() {
@@ -4847,91 +4882,92 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 }
 
 func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
+	c.BeginEvent("write_incremental_modules")
+	defer c.EndEvent("write_incremental_modules")
 	bf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), baseFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
 	if err != nil {
 		return err
 	}
 	defer bf.Close()
-	bBuf := bufio.NewWriterSize(bf, 16*1024*1024)
-	defer bBuf.Flush()
-	bWriter := newNinjaWriter(bBuf)
-	ninjaPath := filepath.Join(filepath.Dir(baseFile), strings.ReplaceAll(filepath.Base(baseFile), ".", "_"))
-	err = os.MkdirAll(JoinPath(c.SrcDir(), ninjaPath), 0755)
-	if err != nil {
-		return err
-	}
+	baseBuf := bufio.NewWriterSize(bf, 16*1024*1024)
+	defer baseBuf.Flush()
+	baseWriter := newNinjaWriter(baseBuf)
 
-	for _, module := range modules {
-		moduleFile := filepath.Join(ninjaPath, module.ModuleCacheKey()+".ninja")
-		if !module.incrementalRestored {
-			err := func() error {
-				mf, err := c.fs.OpenFile(JoinPath(c.SrcDir(), moduleFile), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, OutFilePermissions)
-				if err != nil {
+	if c.GetIncrementalEnabled() {
+		inMemoryWriter := bytes.NewBuffer(nil)
+		var moduleBytes []byte
+		buf := bytes.NewBuffer(nil)
+		for _, module := range modules {
+			if !module.incrementalRestored {
+				inMemoryWriter.Reset()
+				mWriter := newNinjaWriter(inMemoryWriter)
+				if err := c.writeOneModuleAction(module, mWriter, headerTemplate, buf); err != nil {
 					return err
 				}
-				defer mf.Close()
-				mBuf := bufio.NewWriterSize(mf, 4*1024*1024)
-				defer mBuf.Flush()
-				mWriter := newNinjaWriter(mBuf)
-				return c.writeModuleAction([]*moduleInfo{module}, mWriter, headerTemplate)
-			}()
-			if err != nil {
+				moduleBytes = inMemoryWriter.Bytes()
+				c.buildActionsCache.writeNinjaStatements(c.EncContext, module.buildActionCacheKey, moduleBytes)
+			} else if moduleBytes, err = c.buildActionsCache.readNinjaStatements(c.EncContext, module.buildActionCacheKey); err != nil {
 				return err
 			}
+			baseWriter.writer.Write(moduleBytes)
 		}
-		if module.buildActionCacheKey != nil {
-			c.cacheModuleBuildActions(module)
-		}
-		bWriter.Subninja(moduleFile)
+		return nil
+	} else {
+		return c.writeModuleAction(modules, baseWriter, headerTemplate)
 	}
-	return nil
 }
 
 func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
 	buf := bytes.NewBuffer(nil)
-
 	for _, module := range modules {
-		if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 {
-			continue
-		}
-		buf.Reset()
-
-		// In order to make the bootstrap build manifest independent of the
-		// build dir we need to output the Blueprints file locations in the
-		// comments as paths relative to the source directory.
-		relPos := module.pos
-		relPos.Filename = module.relBlueprintsFile
-
-		// Get the name and location of the factory function for the module.
-		factoryFunc := runtime.FuncForPC(reflect.ValueOf(module.factory).Pointer())
-		factoryName := factoryFunc.Name()
-
-		infoMap := map[string]interface{}{
-			"name":      module.Name(),
-			"typeName":  module.typeName,
-			"goFactory": factoryName,
-			"pos":       relPos,
-			"variant":   module.variant.name,
-		}
-		if err := headerTemplate.Execute(buf, infoMap); err != nil {
+		if err := c.writeOneModuleAction(module, nw, headerTemplate, buf); err != nil {
 			return err
 		}
+	}
+	return nil
+}
 
-		if err := nw.Comment(buf.String()); err != nil {
-			return err
-		}
+func (c *Context) writeOneModuleAction(module *moduleInfo, nw *ninjaWriter, headerTemplate *template.Template, buf *bytes.Buffer) error {
+	if len(module.actionDefs.variables)+len(module.actionDefs.rules)+len(module.actionDefs.buildDefs) == 0 {
+		return nil
+	}
+	buf.Reset()
 
-		if err := nw.BlankLine(); err != nil {
-			return err
-		}
+	// In order to make the bootstrap build manifest independent of the
+	// build dir we need to output the Blueprints file locations in the
+	// comments as paths relative to the source directory.
+	relPos := module.pos
+	relPos.Filename = module.relBlueprintsFile
 
-		if err := c.writeLocalBuildActions(nw, &module.actionDefs); err != nil {
-			return err
-		}
+	// Get the name and location of the factory function for the module.
+	factoryFunc := runtime.FuncForPC(reflect.ValueOf(module.factory).Pointer())
+	factoryName := factoryFunc.Name()
 
-		if err := nw.BlankLine(); err != nil {
-			return err
-		}
+	infoMap := map[string]interface{}{
+		"name":      module.Name(),
+		"typeName":  module.typeName,
+		"goFactory": factoryName,
+		"pos":       relPos,
+		"variant":   module.variant.name,
+	}
+	if err := headerTemplate.Execute(buf, infoMap); err != nil {
+		return err
+	}
+
+	if err := nw.Comment(buf.String()); err != nil {
+		return err
+	}
+
+	if err := nw.BlankLine(); err != nil {
+		return err
+	}
+
+	if err := c.writeLocalBuildActions(nw, &module.actionDefs); err != nil {
+		return err
+	}
+
+	if err := nw.BlankLine(); err != nil {
+		return err
 	}
 
 	return nil
@@ -5071,6 +5107,8 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 
 func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 	var providers []CachedProvider
+	var providerHashes []ProviderHash
+
 	for i, p := range module.providers {
 		if p != nil && providerRegistry[i].mutator == "" {
 			providers = append(providers,
@@ -5078,17 +5116,30 @@ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 					Id:    providerRegistry[i],
 					Value: &p,
 				})
+			providerHashes = append(providerHashes,
+				ProviderHash{
+					Id:   providerRegistry[i],
+					Hash: module.providerInitialValueHashes[i],
+				})
 		}
 	}
 
-	data := BuildActionCachedData{
+	buildActionData := BuildActionCachedData{
 		InputHash:        module.buildActionInputHash,
-		Providers:        providers,
+		ProviderHashes:   providerHashes,
 		OrderOnlyStrings: module.orderOnlyStrings,
 		GlobCache:        module.globCache,
 	}
 
-	c.updateBuildActionsCache(module.buildActionCacheKey, &data)
+	providersData := ProviderCachedData{
+		Providers: providers,
+	}
+
+	err := errors.Join(c.buildActionsCache.writeBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData),
+		c.buildActionsCache.writeProviders(c.EncContext, module.buildActionCacheKey, &providersData))
+	if err != nil {
+		panic(err)
+	}
 }
 
 func (c *Context) writeLocalBuildActions(nw *ninjaWriter,

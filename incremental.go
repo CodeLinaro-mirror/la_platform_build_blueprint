@@ -16,12 +16,21 @@ package blueprint
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"path/filepath"
 
+	"github.com/akrylysov/pogreb"
+	"github.com/google/blueprint/dbtools"
 	"github.com/google/blueprint/gobtools"
 )
 
 //go:generate go run gobtools/codegen/gob_gen.go
+
+const buildActionDbName = "incremental.db"
+const providerDbName = "providers.db"
+const referencesDbName = "references.db"
+const ninjaDbName = "ninja.db"
 
 // @auto-generate: gob
 type BuildActionCacheKey struct {
@@ -43,67 +52,143 @@ type CachedProvider struct {
 }
 
 // @auto-generate: gob
+type ProviderCachedData struct {
+	Providers []CachedProvider
+}
+
+// @auto-generate: gob
+type ProviderHash struct {
+	Id   *providerKey
+	Hash uint64
+}
+
+// @auto-generate: gob
 type BuildActionCachedData struct {
 	InputHash        uint64
-	Providers        []CachedProvider
+	ProviderHashes   []ProviderHash
 	OrderOnlyStrings []string
 	GlobCache        []globResultCache
 }
 
 type BuildActionCache struct {
-	db gobtools.KeyValueStore
+	buildActionDb dbtools.KeyValueStore
+	// Use a separate DB for providers so that we only read them when necessary.
+	providerDb   dbtools.KeyValueStore
+	referencesDb dbtools.KeyValueStore
+	ninjaDb      dbtools.KeyValueStore
 }
 
 func (b *BuildActionCache) openForTests() error {
-	if b.db != nil {
+	if b.buildActionDb != nil || b.providerDb != nil || b.referencesDb != nil || b.ninjaDb != nil {
 		panic(fmt.Errorf("db is already open"))
 	}
 
-	b.db = &gobtools.InMemKeyValueStore{}
+	b.buildActionDb = &dbtools.InMemKeyValueStore{}
+	b.providerDb = &dbtools.InMemKeyValueStore{}
+	b.referencesDb = &dbtools.InMemKeyValueStore{}
+	b.ninjaDb = &dbtools.InMemKeyValueStore{}
 	return nil
 }
 
 func (b *BuildActionCache) open(dbPath string) error {
-	// Uncomment the code below once we support pogreb.
-	/*
-		if b.db != nil {
-			panic(fmt.Errorf("db is already open"))
-		}
-		db, err := pogreb.Open(dbPath, nil)
-		if err != nil {
-			return err
-		}
-		b.db = db
-		return nil
-	*/
-	panic(fmt.Errorf("db support is not ready yet"))
+	if b.buildActionDb != nil || b.providerDb != nil || b.referencesDb != nil {
+		panic(fmt.Errorf("db is already open"))
+	}
+	db, err := pogreb.Open(filepath.Join(dbPath, buildActionDbName), nil)
+	if err != nil {
+		return err
+	}
+	b.buildActionDb = db
+
+	db, err = pogreb.Open(filepath.Join(dbPath, providerDbName), nil)
+	if err != nil {
+		return err
+	}
+	b.providerDb = db
+
+	db, err = pogreb.Open(filepath.Join(dbPath, referencesDbName), nil)
+	if err != nil {
+		return err
+	}
+	b.referencesDb = db
+
+	db, err = pogreb.Open(filepath.Join(dbPath, ninjaDbName), nil)
+	if err != nil {
+		return err
+	}
+	b.ninjaDb = db
+
+	return nil
 }
 
-func (b *BuildActionCache) read(ctx gobtools.EncContext, key *BuildActionCacheKey) (*BuildActionCachedData, error) {
-	v, err := b.db.Get(key.bytes(ctx))
-	if err != nil {
-		return nil, err
-	}
-	if v == nil {
-		return nil, nil
-	}
+func (b *BuildActionCache) close() error {
+	return errors.Join(
+		b.buildActionDb.Close(),
+		b.providerDb.Close(),
+		b.referencesDb.Close(),
+		b.ninjaDb.Close())
+}
 
-	buf := bytes.NewReader(v)
+func (b *BuildActionCache) reset(c *Context, dbPath string) error {
+	return errors.Join(
+		c.fs.Remove(filepath.Join(dbPath, buildActionDbName)),
+		c.fs.Remove(filepath.Join(dbPath, providerDbName)),
+		c.fs.Remove(filepath.Join(dbPath, referencesDbName)),
+		c.fs.Remove(filepath.Join(dbPath, ninjaDbName)))
+}
+
+func (b *BuildActionCache) readBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey) (*BuildActionCachedData, error) {
 	var ret BuildActionCachedData
-	err = ret.Decode(ctx, buf)
-	if err != nil {
+	if err := read(ctx, b.buildActionDb, key, &ret); err != nil {
 		return nil, err
 	}
 	return &ret, nil
 }
 
-func (b *BuildActionCache) write(ctx gobtools.EncContext, key *BuildActionCacheKey, data *BuildActionCachedData) error {
+func (b *BuildActionCache) readProviders(ctx gobtools.EncContext, key *BuildActionCacheKey) (*ProviderCachedData, error) {
+	var ret ProviderCachedData
+	if err := read(ctx, b.providerDb, key, &ret); err != nil {
+		return nil, err
+	}
+	return &ret, nil
+}
+
+func (b *BuildActionCache) readNinjaStatements(ctx gobtools.EncContext, key *BuildActionCacheKey) ([]byte, error) {
+	return b.ninjaDb.Get(key.bytes(ctx))
+}
+
+func read(ctx gobtools.EncContext, db dbtools.KeyValueStore, key *BuildActionCacheKey, ret gobtools.CustomDec) error {
+	v, err := db.Get(key.bytes(ctx))
+	if err != nil {
+		return err
+	}
+	if v == nil {
+		return nil
+	}
+
+	buf := bytes.NewReader(v)
+	return ret.Decode(ctx, buf)
+}
+
+func (b *BuildActionCache) writeBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey, data *BuildActionCachedData) error {
+	return write(ctx, b.buildActionDb, key, data)
+}
+
+func (b *BuildActionCache) writeProviders(ctx gobtools.EncContext, key *BuildActionCacheKey, data *ProviderCachedData) error {
+	return write(ctx, b.providerDb, key, data)
+}
+
+func (b *BuildActionCache) writeNinjaStatements(ctx gobtools.EncContext, key *BuildActionCacheKey, data []byte) error {
+	return b.ninjaDb.Put(key.bytes(ctx), data)
+}
+
+func write(ctx gobtools.EncContext, db dbtools.KeyValueStore, key *BuildActionCacheKey, data gobtools.CustomEnc) error {
 	buf := &bytes.Buffer{}
 	err := data.Encode(ctx, buf)
 	if err != nil {
 		return err
 	}
-	err = b.db.Put(key.bytes(ctx), buf.Bytes())
+	err = db.Put(key.bytes(ctx), buf.Bytes())
 	if err != nil {
 		return err
 	}

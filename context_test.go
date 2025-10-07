@@ -19,8 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"os"
-	"path"
 	"reflect"
 	"slices"
 	"strconv"
@@ -149,6 +147,9 @@ func (b *baseTestModule) GenerateBuildActions(ctx ModuleContext) {
 	for _, src := range b.properties.Srcs {
 		ctx.GlobWithDeps(src, b.properties.Exclude_srcs)
 	}
+	ctx.VisitDirectDeps(func(module Module) {
+		OtherModuleProvider(ctx, module, IncrementalTestProviderKey)
+	})
 	SetProvider(ctx, IncrementalTestProviderKey, IncrementalTestProvider{
 		Value: ctx.ModuleName(),
 	})
@@ -186,6 +187,17 @@ type incrementalModule struct {
 }
 
 var _ Incremental = &incrementalModule{}
+
+const incrementalModuleNinja string = `# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # #
+# Module:  MyIncrementalModule
+# Variant:
+# Type:    incremental_module
+# Factory: github.com/google/blueprint.newIncrementalModule
+# Defined: Android.bp:2:4
+
+build MyIncrementalModule_phony_output: phony || dedup-d479e9a8133ff998
+    tags = module_name=MyIncrementalModule;module_type=incremental_module;rule_name=phony
+`
 
 func newIncrementalModule() (Module, []interface{}) {
 	m := &incrementalModule{}
@@ -820,10 +832,13 @@ func Test_parallelVisit(t *testing.T) {
 	moduleI := create("I")
 	moduleJ := create("J")
 
-	// A depends on B, B depends on C.  Nothing depends on D through G, and they don't depend on
-	// anything. H depends on I, and I and J depend on each other.
+	// A depends on B, B depends on C.
 	addDep(moduleA, moduleB)
 	addDep(moduleB, moduleC)
+
+	// Nothing depends on D through G, and they don't depend on anything.
+
+	// H depends on I, and I and J depend on each other.
 	addDep(moduleH, moduleI)
 	addDep(moduleI, moduleJ)
 	addDep(moduleJ, moduleI)
@@ -1030,8 +1045,14 @@ func Test_parallelVisit(t *testing.T) {
 		}
 	})
 	t.Run("existing cycle", func(t *testing.T) {
-		errs := parallelVisit(slices.Values([]*moduleInfo{moduleH, moduleI, moduleJ}), bottomUpVisitorImpl{}, 3,
+		errs := parallelVisit(slices.Values([]*moduleInfo{moduleG, moduleH, moduleI, moduleJ}), bottomUpVisitorImpl{}, 3,
 			func(module *moduleInfo, pause pauseFunc) bool {
+				if module == moduleG {
+					// Pause module G on module I.  This verifies the fix for b/433694465, where
+					// having a module paused on a cycle of existing dependencies could drop
+					// the cycle error.
+					pause(moduleI)
+				}
 				return false
 			})
 		want := []string{
@@ -1565,6 +1586,7 @@ func incrementalSetup(t *testing.T) *Context {
 					name: "MyFooModule",
 					outputs: ["MyFooModule_phony_output"],
 					order_only: ["test.lib"],
+					deps: ["MyIncrementalModule"],
 			}
 		`
 
@@ -1600,15 +1622,23 @@ func incrementalSetupForRestore(ctx *Context, orderOnlyStrings []string) any {
 	}
 	cacheKey, hash := calculateHashKey(incInfo, [][]uint64{providerHashes})
 	var providerValue any = IncrementalTestProvider{Value: "MyIncrementalModule"}
-	ctx.buildActionsCache.write(ctx.CodecContext, &cacheKey, &BuildActionCachedData{
+	providerHash, _ := proptools.CalculateHash(providerValue)
+	ctx.buildActionsCache.writeBuildAction(ctx.EncContext, &cacheKey, &BuildActionCachedData{
 		InputHash: hash,
-		Providers: []CachedProvider{{
-			Id:    &IncrementalTestProviderKey.providerKey,
-			Value: &providerValue,
+		ProviderHashes: []ProviderHash{{
+			Id:   &IncrementalTestProviderKey.providerKey,
+			Hash: providerHash,
 		}},
 		OrderOnlyStrings: orderOnlyStrings,
 		GlobCache:        calculateGlobCache(),
 	})
+	ctx.buildActionsCache.writeProviders(ctx.EncContext, &cacheKey, &ProviderCachedData{
+		Providers: []CachedProvider{{
+			Id:    &IncrementalTestProviderKey.providerKey,
+			Value: &providerValue,
+		}},
+	})
+	ctx.buildActionsCache.writeNinjaStatements(ctx.EncContext, &cacheKey, []byte(incrementalModuleNinja))
 	ctx.SetIncrementalEnabled(true)
 	ctx.SetIncrementalAnalysis(true)
 
@@ -1673,7 +1703,7 @@ func TestCacheBuildActions(t *testing.T) {
 	//	t.Errorf("build actions are not cached for the incremental module")
 	//}
 	cacheKey, hash := calculateHashKey(incInfo, [][]uint64{barInfo.providerInitialValueHashes})
-	cache, err := ctx.buildActionsCache.read(ctx.CodecContext, &cacheKey)
+	cache, err := ctx.buildActionsCache.readBuildAction(ctx.EncContext, &cacheKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
@@ -1681,17 +1711,44 @@ func TestCacheBuildActions(t *testing.T) {
 		t.Errorf("failed to find cached build actions for the incremental module")
 	}
 	var providerValue any = IncrementalTestProvider{Value: "MyIncrementalModule"}
+	providerHash, _ := proptools.CalculateHash(providerValue)
 	expectedCache := BuildActionCachedData{
 		InputHash: hash,
-		Providers: []CachedProvider{{
-			Id:    &IncrementalTestProviderKey.providerKey,
-			Value: &providerValue,
+		ProviderHashes: []ProviderHash{{
+			Id:   &IncrementalTestProviderKey.providerKey,
+			Hash: providerHash,
 		}},
 		OrderOnlyStrings: []string{"dedup-d479e9a8133ff998"},
 		GlobCache:        calculateGlobCache(),
 	}
 	if !reflect.DeepEqual(expectedCache, *cache) {
 		t.Errorf("expected: %v actual %v", expectedCache, *cache)
+	}
+
+	providers, err := ctx.buildActionsCache.readProviders(ctx.EncContext, &cacheKey)
+	if err != nil {
+		t.Fatalf("read failed with an error: %s", err)
+	}
+	if providers == nil {
+		t.Errorf("failed to find cached build actions for the incremental module")
+	}
+	expectedProviders := ProviderCachedData{
+		Providers: []CachedProvider{{
+			Id:    &IncrementalTestProviderKey.providerKey,
+			Value: &providerValue,
+		}},
+	}
+	if !reflect.DeepEqual(expectedProviders, *providers) {
+		t.Errorf("expected: %v actual %v", expectedProviders, *providers)
+	}
+
+	ninja, err := ctx.buildActionsCache.readNinjaStatements(ctx.EncContext, &cacheKey)
+	if err != nil {
+		t.Fatalf("read failed with an error: %s", err)
+	}
+	ninjaStr := string(ninja)
+	if !strings.Contains(ninjaStr, incrementalModuleNinja) {
+		t.Errorf("expected: %v actual %v", incrementalModuleNinja, ninjaStr)
 	}
 }
 
@@ -1777,10 +1834,14 @@ func TestSkipNinjaForCacheHit(t *testing.T) {
 		t.Errorf("ninja file doesn't have build statements for MyBarModule: %s", string(content))
 	}
 
-	file, err = ctx.fs.Open(path.Join("test_incremental_ninja",
-		calculateFileNameHash(".-MyIncrementalModule-none-incremental_module")+".ninja"))
-	if !os.IsNotExist(err) {
-		t.Errorf("shouldn't generate ninja file for MyIncrementalModule: %s", err.Error())
+	file, err = ctx.fs.Open("test.incremental.ninja")
+	if err != nil {
+		t.Errorf("no ninja file for MyIncrementalModule")
+	}
+	content = make([]byte, 1024)
+	file.Read(content)
+	if !strings.Contains(string(content), incrementalModuleNinja) {
+		t.Errorf("ninja file doesn't have build statements for MyIncrementalModule: %s", string(content))
 	}
 }
 
@@ -1812,11 +1873,11 @@ func TestNotSkipNinjaForCacheMiss(t *testing.T) {
 		t.Errorf("ninja file doesn't have build statements for MyBarModule: %s", string(content))
 	}
 
-	file, err = ctx.fs.Open(path.Join("test_incremental_ninja",
-		calculateFileNameHash(".-MyIncrementalModule-none-incremental_module")+".ninja"))
+	file, err = ctx.fs.Open("test.incremental.ninja")
 	if err != nil {
 		t.Errorf("no ninja file for MyIncrementalModule")
 	}
+	content = make([]byte, 1024)
 	file.Read(content)
 	if !strings.Contains(string(content), "build MyIncrementalModule_phony_output: phony") {
 		t.Errorf("ninja file doesn't have build statements for MyIncrementalModule: %s", string(content))
@@ -2053,7 +2114,7 @@ func verifyOrderOnlyStringsCache(t *testing.T, ctx *Context, incInfo, barInfo *m
 	// Verify that the dedup-* order only strings used by MyIncrementalModule is
 	// cached along with its other cached values
 	cacheKey, _ := calculateHashKey(incInfo, [][]uint64{barInfo.providerInitialValueHashes})
-	cache, err := ctx.buildActionsCache.read(ctx.CodecContext, &cacheKey)
+	cache, err := ctx.buildActionsCache.readBuildAction(ctx.EncContext, &cacheKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
