@@ -26,7 +26,9 @@ import (
 
 	"github.com/google/blueprint/dbtools"
 	"github.com/google/blueprint/gobtools"
+	"github.com/google/blueprint/pool"
 	"github.com/google/blueprint/proptools"
+	"github.com/google/blueprint/syncmap"
 )
 
 //go:generate go run gobtools/codegen/gob_gen.go
@@ -61,7 +63,7 @@ func (k *ProviderCacheKey) bytes() []byte {
 // @auto-generate: gob
 type CachedProvider struct {
 	Id    *providerKey
-	Value *any
+	Value any
 }
 
 // @auto-generate: gob
@@ -80,14 +82,14 @@ type ModuleActionCachedData struct {
 
 // @auto-generate: gob
 type SingletonActionCachedData struct {
-	ProviderHashes map[int]proptools.Hash
+	ProviderHashes           []ProviderHash
+	DependencyProviderHashes map[int]proptools.Hash
 }
 
-// A dbWriteRequest is passed to writer() through writerCh to write a key-value pair to a database.
+// A dbWriteRequest is passed to providerDbWriter() through writerCh to write a key-value pair to a database.
 type dbWriteRequest struct {
-	db    dbtools.KeyValueStore
-	key   []byte
-	value []byte
+	key   proptools.Hash
+	value *bytes.Buffer
 }
 
 type BuildActionCache struct {
@@ -100,10 +102,16 @@ type BuildActionCache struct {
 
 	writerCh   chan dbWriteRequest
 	writerDone chan bool
+
+	hashesInProviderDb   map[proptools.Hash]struct{}
+	cachedProviderHashes syncmap.SyncMap[proptools.Hash, CachedProvider]
 }
 
+var bufferPool = pool.New[bytes.Buffer]()
+
 func (b *BuildActionCache) openForTests() error {
-	b.writer()
+	b.hashesInProviderDb = make(map[proptools.Hash]struct{})
+	b.providerDbWriter()
 	b.moduleActionsDb = &dbtools.InMemKeyValueStore{}
 	b.singletonActionsDb = &dbtools.InMemKeyValueStore{}
 	b.providerDb = &dbtools.InMemKeyValueStore{}
@@ -113,7 +121,8 @@ func (b *BuildActionCache) openForTests() error {
 }
 
 func (b *BuildActionCache) open(dbPath string) error {
-	b.writer()
+	b.hashesInProviderDb = make(map[proptools.Hash]struct{})
+	b.providerDbWriter()
 	return errors.Join(
 		openDb(dbPath, moduleActionsDbName, &b.moduleActionsDb),
 		openDb(dbPath, singletonActionsDbName, &b.singletonActionsDb),
@@ -123,21 +132,33 @@ func (b *BuildActionCache) open(dbPath string) error {
 	)
 }
 
-// writer starts a background goroutine that takes write requests from
+// providerDbWriter starts a background goroutine that takes write requests from
 // b.writerCh and writes them to the database.  It avoids lock contention
-// on the database by moving all writes into a single goroutine.
-func (b *BuildActionCache) writer() {
+// on the database by moving all writes into a single goroutine, and verifies
+// that a given provider hash is only written once.
+func (b *BuildActionCache) providerDbWriter() {
 	b.writerCh = make(chan dbWriteRequest, 1000)
 	b.writerDone = make(chan bool)
 	go func() {
 		defer close(b.writerDone)
 		for req := range b.writerCh {
-			err := req.db.Put(req.key, req.value)
-			if err != nil {
-				panic(err)
-			}
+			b.handleDbWriteRequest(req)
 		}
 	}()
+}
+
+func (b *BuildActionCache) handleDbWriteRequest(req dbWriteRequest) {
+	// The request contains a buffer in req.value that should be returned to the pool.
+	defer bufferPool.Put(req.value)
+
+	if _, stored := b.hashesInProviderDb[req.key]; stored {
+		return
+	}
+	b.hashesInProviderDb[req.key] = struct{}{}
+	err := b.providerDb.Put(req.key.Bytes(), req.value.Bytes())
+	if err != nil {
+		panic(err)
+	}
 }
 
 func openDb(dbPath string, dbName string, dbToOpen *dbtools.KeyValueStore) error {
@@ -155,16 +176,16 @@ func openDb(dbPath string, dbName string, dbToOpen *dbtools.KeyValueStore) error
 func (b *BuildActionCache) flush() {
 	// Close the writerCh.  Any calls to write() concurrent with the call to flush() may panic.
 	close(b.writerCh)
-	// Wait for the writer goroutine to finish.
+	// Wait for the providerDbWriter goroutine to finish.
 	<-b.writerDone
-	// Restart the writer goroutine
-	b.writer()
+	// Restart the providerDbWriter goroutine
+	b.providerDbWriter()
 }
 
 func (b *BuildActionCache) close() error {
 	// Close the writerCh.  Any calls to write() after this will panic.
 	close(b.writerCh)
-	// Wait for the writer goroutine to finish.
+	// Wait for the providerDbWriter goroutine to finish.
 	<-b.writerDone
 	return errors.Join(
 		b.moduleActionsDb.Close(),
@@ -188,50 +209,72 @@ func (b *BuildActionCache) reset(c *Context, dbPath string) error {
 
 func (b *BuildActionCache) readModuleBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey) (*ModuleActionCachedData, error) {
 	var ret ModuleActionCachedData
-	if err := read(ctx, b.moduleActionsDb, key.bytes(), &ret); err != nil {
+	if ok, err := read(ctx, b.moduleActionsDb, key.bytes(), &ret); err != nil {
 		return nil, err
+	} else if !ok {
+		return nil, nil
 	}
 	return &ret, nil
-}
-
-func (b *BuildActionCache) readSingletonBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey) (*SingletonActionCachedData, error) {
-	var ret SingletonActionCachedData
-	if err := read(ctx, b.singletonActionsDb, key.bytes(), &ret); err != nil {
-		return nil, err
-	}
-	return &ret, nil
-}
-
-func (b *BuildActionCache) readProvider(ctx gobtools.EncContext, key *BuildActionCacheKey, provider *providerKey) (CachedProvider, error) {
-	var ret CachedProvider
-	providerKey := ProviderCacheKey{
-		*key,
-		provider.id,
-	}
-	err := read(ctx, b.providerDb, providerKey.bytes(), &ret)
-	if err != nil {
-		if *ret.Id != *provider {
-			panic(fmt.Errorf("restored provider %#v but got provider %#v", provider, ret.Id))
-		}
-	}
-	return ret, err
 }
 
 func (b *BuildActionCache) readNinjaStatements(key *BuildActionCacheKey) ([]byte, error) {
 	return b.ninjaDb.Get(key.bytes())
 }
 
-func read(ctx gobtools.EncContext, db dbtools.KeyValueStore, key []byte, ret gobtools.CustomDec) error {
+func (b *BuildActionCache) readSingletonBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey) (*SingletonActionCachedData, error) {
+	var ret SingletonActionCachedData
+	if ok, err := read(ctx, b.singletonActionsDb, key.bytes(), &ret); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, nil
+	}
+	return &ret, nil
+}
+
+func (b *BuildActionCache) readProvider(ctx gobtools.EncContext, hash proptools.Hash, provider *providerKey) (CachedProvider, error) {
+	checkProvider := func(ret CachedProvider) {
+		if *ret.Id != *provider {
+			panic(fmt.Errorf("restored provider %#v but got provider %#v", provider, ret.Id))
+		}
+	}
+
+	// Return the copy cached in memory if it has already been read from the disk cache.
+	if cached, ok := b.cachedProviderHashes.Load(hash); ok {
+		checkProvider(cached)
+		return cached, nil
+	}
+
+	// Read from the disk cache.
+	var ret CachedProvider
+	ok, err := read(ctx, b.providerDb, hash.Bytes(), &ret)
+	if err != nil {
+		return CachedProvider{}, err
+	} else if !ok {
+		return CachedProvider{}, nil
+	}
+
+	checkProvider(ret)
+
+	// Insert into the in-memory cache.
+	ret, loaded := b.cachedProviderHashes.LoadOrStore(hash, ret)
+	if loaded {
+		checkProvider(ret)
+	}
+
+	return ret, nil
+}
+
+func read(ctx gobtools.EncContext, db dbtools.KeyValueStore, key []byte, ret gobtools.CustomDec) (bool, error) {
 	v, err := db.Get(key)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if v == nil {
-		return nil
+		return false, nil
 	}
 
 	buf := bytes.NewReader(v)
-	return ret.Decode(ctx, buf)
+	return true, ret.Decode(ctx, buf)
 }
 
 func (b *BuildActionCache) writeModuleBuildAction(ctx gobtools.EncContext, key *BuildActionCacheKey, data *ModuleActionCachedData) error {
@@ -242,16 +285,20 @@ func (b *BuildActionCache) writeSingletonBuildAction(ctx gobtools.EncContext, ke
 	return b.write(ctx, b.singletonActionsDb, key.bytes(), data)
 }
 
-func (b *BuildActionCache) writeProviders(ctx gobtools.EncContext, key *BuildActionCacheKey, providers []CachedProvider) error {
-	for _, p := range providers {
-		providerKey := ProviderCacheKey{
-			*key,
-			p.Id.id,
-		}
-		err := b.write(ctx, b.providerDb, providerKey.bytes(), p)
-		if err != nil {
-			return err
-		}
+func (b *BuildActionCache) writeProvider(ctx gobtools.EncContext, hash proptools.Hash, provider CachedProvider) error {
+	buf := bufferPool.Get()
+	buf.Reset()
+
+	err := provider.Encode(ctx, buf)
+	if err != nil {
+		bufferPool.Put(buf)
+		return err
+	}
+
+	// The buffer is transferred to the dbWriteRequest, so it must not be returned to the pool.
+	b.writerCh <- dbWriteRequest{
+		key:   hash,
+		value: buf,
 	}
 	return nil
 }
@@ -260,20 +307,18 @@ func (b *BuildActionCache) writeNinjaStatements(key *BuildActionCacheKey, data [
 	return b.ninjaDb.Put(key.bytes(), data)
 }
 
-// write encodes data to a byte buffer, and then sends a write request to the writer goroutine to write it to the
+// write encodes data to a byte buffer, and then sends a write request to the providerDbWriter goroutine to write it to the
 // database.
 func (b *BuildActionCache) write(ctx gobtools.EncContext, db dbtools.KeyValueStore, key []byte, data gobtools.CustomEnc) error {
-	buf := &bytes.Buffer{}
+	buf := bufferPool.Get()
+	defer bufferPool.Put(buf)
+	buf.Reset()
+
 	err := data.Encode(ctx, buf)
 	if err != nil {
 		return err
 	}
-	b.writerCh <- dbWriteRequest{
-		db:    db,
-		key:   key,
-		value: buf.Bytes(),
-	}
-	return nil
+	return db.Put(key, buf.Bytes())
 }
 
 // @auto-generate: gob

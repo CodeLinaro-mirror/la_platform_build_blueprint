@@ -180,6 +180,8 @@ type Context struct {
 	// latter will depend on the flag above.
 	incrementalEnabled bool
 
+	incrementalProviderTest bool
+
 	buildActionsCache       *BuildActionCache
 	buildActionsToCacheLock sync.Mutex
 	orderOnlyStringsCache   OrderOnlyStringsCache
@@ -618,6 +620,12 @@ type singletonInfo struct {
 	startedGenerateBuildActions  bool
 	finishedGenerateBuildActions bool
 	commonIncrementalInfo
+	// The provider hashes of all the singletons that this singleton might depend on.
+	// These values are calculated before calling the GenerateBuildAction of the current
+	// singleton, and combined with the hashes of all the module providers that this
+	// singleton might depend on, we can decide if the input of the GenerateBuildAction
+	// has any change, and skip the execution of it if there is no change.
+	providerValueHashes []proptools.Hash
 }
 
 type mutatorInfo struct {
@@ -785,6 +793,10 @@ func (c *Context) GetIncrementalAnalysis() bool {
 
 func (c *Context) SetIncrementalEnabled(incremental bool) {
 	c.incrementalEnabled = incremental
+}
+
+func (c *Context) SetIncrementalProviderTest(test bool) {
+	c.incrementalProviderTest = test
 }
 
 func (c *Context) GetIncrementalEnabled() bool {
@@ -3440,7 +3452,7 @@ func (c *Context) generateModuleBuildActions(config interface{},
 						}
 					}
 				}()
-				if !mctx.restoreModuleBuildActions() {
+				if !mctx.restoreModuleBuildActions() || c.incrementalProviderTest {
 					mctx.module.logicModule.GenerateBuildActions(mctx)
 				}
 			}()
@@ -3559,7 +3571,7 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 		}()
 
 		c.restoreSingleton(info)
-		if !info.incrementalRestored {
+		if !info.incrementalRestored || c.incrementalProviderTest {
 			info.singleton.GenerateBuildActions(sctx)
 		}
 		// A caching entry for singletons is only written if the singleton
@@ -3573,25 +3585,40 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 		if info.buildActionCacheKey != nil && !info.incrementalRestored && len(sctx.depProviders) > 0 {
 			cache := make(map[int]proptools.Hash)
 			for k, _ := range sctx.depProviders {
-				cache[k] = c.providerValueHashes[k]
-			}
-			if err := c.buildActionsCache.writeSingletonBuildAction(c.EncContext, info.buildActionCacheKey,
-				&SingletonActionCachedData{ProviderHashes: cache}); err != nil {
-				panic(err)
+				// A singleton might depend on both module providers and singleton providers, and
+				// the hashes of all the former are stored in context globally, and the hashes of
+				// the latter are stored inside the current singletonInfo.
+				if providerRegistry[k].mutator == singletonTag {
+					cache[k] = info.providerValueHashes[k]
+				} else {
+					cache[k] = c.providerValueHashes[k]
+				}
 			}
 
-			var providers []CachedProvider
+			var providerHashes []ProviderHash
 			for i, p := range info.providers {
 				if p == nil {
 					continue
 				}
-				providers = append(providers,
-					CachedProvider{
-						Id:    providerRegistry[i],
-						Value: &p,
+				err := c.buildActionsCache.writeProvider(c.EncContext, info.providerInitialValueHashes[i], CachedProvider{
+					Id:    providerRegistry[i],
+					Value: p,
+				})
+				if err != nil {
+					panic(err)
+				}
+				providerHashes = append(providerHashes,
+					ProviderHash{
+						Id:   providerRegistry[i],
+						Hash: info.providerInitialValueHashes[i],
 					})
 			}
-			if err := c.buildActionsCache.writeProviders(c.EncContext, info.buildActionCacheKey, providers); err != nil {
+
+			if err := c.buildActionsCache.writeSingletonBuildAction(c.EncContext, info.buildActionCacheKey,
+				&SingletonActionCachedData{
+					ProviderHashes:           providerHashes,
+					DependencyProviderHashes: cache,
+				}); err != nil {
 				panic(err)
 			}
 		}
@@ -3631,10 +3658,23 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 				// values, ensuring that any behavioral change is captured by the input providers hashes.
 				// When a incremental doesn't have any cached provider, it means the input of the singleton
 				// was not captured or it doesn't depend on any input, so we always run it.
-				info.incrementalRestored = len(data.ProviderHashes) != 0
-				for k, v := range data.ProviderHashes {
-					if c.providerValueHashes[k] != v {
+				info.incrementalRestored = len(data.DependencyProviderHashes) != 0
+				for k, v := range data.DependencyProviderHashes {
+					var hash proptools.Hash
+					if providerRegistry[k].mutator == singletonTag {
+						hash = info.providerValueHashes[k]
+					} else {
+						hash = c.providerValueHashes[k]
+					}
+					if hash != v {
 						info.incrementalRestored = false
+						break
+					}
+				}
+				if info.incrementalRestored {
+					info.providerInitialValueHashes = make([]proptools.Hash, len(providerRegistry))
+					for _, provider := range data.ProviderHashes {
+						info.providerInitialValueHashes[provider.Id.id] = provider.Hash
 					}
 				}
 			}
@@ -3703,13 +3743,11 @@ func (c *Context) calculateProvidersHashes() {
 
 			var providerHashes []proptools.Hash
 			// For singleton providers we collect provider hashes from singletons.
-			if providerRegistry[i].mutator == singletonTag {
-				c.VisitAllSingletons(func(s SingletonProxy) {
-					providerHashes = append(providerHashes, s.singleton.providerInitialValueHashes[i])
-				})
-			} else {
+			if providerRegistry[i].mutator != singletonTag {
 				c.visitAllModuleInfos(func(m *moduleInfo) {
-					providerHashes = append(providerHashes, m.providerInitialValueHashes[i])
+					if m.providerInitialValueHashes != nil {
+						providerHashes = append(providerHashes, m.providerInitialValueHashes[i])
+					}
 				})
 			}
 			var err error
@@ -3753,6 +3791,27 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 
 	for _, info := range singletons {
 		if !info.parallel {
+			if c.GetIncrementalEnabled() {
+				// A singleton might depend on modules and other singletons that run before it.
+				// We already captured the provider hashes of all the modules in calculateProvidersHashes,
+				// now we calculate the hashes of all singletons that the current one might depend on.
+				info.providerValueHashes = make([]proptools.Hash, len(providerRegistry))
+				for i := range len(providerRegistry) {
+					var providerHashes []proptools.Hash
+					if providerRegistry[i].mutator == singletonTag {
+						c.VisitAllSingletons(func(s SingletonProxy) {
+							if s.singleton.providerInitialValueHashes != nil {
+								providerHashes = append(providerHashes, s.singleton.providerInitialValueHashes[i])
+							}
+						})
+					}
+					var err error
+					info.providerValueHashes[i], err = proptools.CalculateHash(providerHashes)
+					if err != nil {
+						panic(err)
+					}
+				}
+			}
 			runSingleton(info)
 			if len(errs) > maxErrors {
 				break
@@ -5060,7 +5119,7 @@ func (c *Context) writeIncrementalModules(modules []*moduleInfo, baseWriter *nin
 		var moduleBytes []byte
 		var err error
 
-		if m.incrementalRestored {
+		if m.incrementalRestored && !c.incrementalProviderTest {
 			// Read from the cache if the module is restored.
 			moduleBytes, err = c.buildActionsCache.readNinjaStatements(m.buildActionCacheKey)
 		} else {
@@ -5180,7 +5239,7 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 	inMemoryWriter := bytes.NewBuffer(nil)
 
 	for _, info := range c.singletonInfo {
-		if info.incrementalRestored {
+		if info.incrementalRestored && !c.incrementalProviderTest {
 			// Read from the cache if the singleton is restored.
 			ninjaBytes, err = c.buildActionsCache.readNinjaStatements(info.buildActionCacheKey)
 			if err != nil {
@@ -5316,16 +5375,18 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 }
 
 func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
-	var providers []CachedProvider
 	var providerHashes []ProviderHash
 
 	for i, p := range module.providers {
 		if p != nil && providerRegistry[i].mutator == "" {
-			providers = append(providers,
+			err := c.buildActionsCache.writeProvider(c.EncContext, module.providerInitialValueHashes[i],
 				CachedProvider{
 					Id:    providerRegistry[i],
-					Value: &p,
+					Value: p,
 				})
+			if err != nil {
+				panic(err)
+			}
 			providerHashes = append(providerHashes,
 				ProviderHash{
 					Id:   providerRegistry[i],
@@ -5341,8 +5402,7 @@ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 		GlobCache:        module.globCache,
 	}
 
-	err := errors.Join(c.buildActionsCache.writeModuleBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData),
-		c.buildActionsCache.writeProviders(c.EncContext, module.buildActionCacheKey, providers))
+	err := c.buildActionsCache.writeModuleBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData)
 	if err != nil {
 		panic(err)
 	}
