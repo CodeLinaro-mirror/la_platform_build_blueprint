@@ -3464,7 +3464,7 @@ func (c *Context) generateModuleBuildActions(config interface{},
 				return true
 			}
 
-			if module.missingDeps != nil && !mctx.handledMissingDeps {
+			if module.missingDeps != nil && !mctx.handledMissingDeps && !module.incrementalRestored {
 				var errs []error
 				for _, depName := range module.missingDeps {
 					errs = append(errs, c.missingDependencyError(module, depName))
@@ -3582,7 +3582,7 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 		// An edge case where a coding change removes a provider dependency is safely handled
 		// because any detected code change automatically invalidates the entire global cache,
 		// ensuring system consistency.
-		if info.buildActionCacheKey != nil && !info.incrementalRestored && len(sctx.depProviders) > 0 {
+		if info.buildActionCacheKey != nil && !info.incrementalRestored {
 			cache := make(map[int]proptools.Hash)
 			for k, _ := range sctx.depProviders {
 				// A singleton might depend on both module providers and singleton providers, and
@@ -3641,43 +3641,51 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 
 func (c *Context) restoreSingleton(info *singletonInfo) {
 	info.incrementalSupported = c.GetIncrementalEnabled() && info.singleton.IncrementalSupported()
-	if info.incrementalSupported {
-		info.buildActionCacheKey = &BuildActionCacheKey{
-			Id: info.name,
+	if !info.incrementalSupported {
+		return
+	}
+
+	info.buildActionCacheKey = &BuildActionCacheKey{
+		Id: info.name,
+	}
+
+	// We can pursue a incremental analysis because there is no soong coding change, no
+	// product config and env variable changes.
+	if !c.GetIncrementalAnalysis() {
+		return
+	}
+
+	data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, info.buildActionCacheKey)
+	if err != nil {
+		panic(err)
+	}
+	if data == nil {
+		return
+	}
+
+	// This logic here assumes a singleton's behavior is a pure function of its providers.
+	// Conditional access to certain providers must also be based on other provider
+	// values, ensuring that any behavioral change is captured by the input providers hashes.
+	incrementalRestored := true
+	for k, v := range data.DependencyProviderHashes {
+		var hash proptools.Hash
+		if providerRegistry[k].mutator == singletonTag {
+			hash = info.providerValueHashes[k]
+		} else {
+			hash = c.providerValueHashes[k]
 		}
-		// We can pursue a incremental analysis because there is no soong coding change, no
-		// product config and env variable changes.
-		if c.GetIncrementalAnalysis() {
-			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, info.buildActionCacheKey)
-			if err != nil {
-				panic(err)
-			}
-			if data != nil {
-				// This logic here assumes a singleton's behavior is a pure function of its providers.
-				// Conditional access to certain providers must also be based on other provider
-				// values, ensuring that any behavioral change is captured by the input providers hashes.
-				// When a incremental doesn't have any cached provider, it means the input of the singleton
-				// was not captured or it doesn't depend on any input, so we always run it.
-				info.incrementalRestored = len(data.DependencyProviderHashes) != 0
-				for k, v := range data.DependencyProviderHashes {
-					var hash proptools.Hash
-					if providerRegistry[k].mutator == singletonTag {
-						hash = info.providerValueHashes[k]
-					} else {
-						hash = c.providerValueHashes[k]
-					}
-					if hash != v {
-						info.incrementalRestored = false
-						break
-					}
-				}
-				if info.incrementalRestored {
-					info.providerInitialValueHashes = make([]proptools.Hash, len(providerRegistry))
-					for _, provider := range data.ProviderHashes {
-						info.providerInitialValueHashes[provider.Id.id] = provider.Hash
-					}
-				}
-			}
+		if hash != v {
+			incrementalRestored = false
+			break
+		}
+	}
+	if incrementalRestored {
+		info.incrementalRestored = true
+		info.providerInitialValueHashes = make([]proptools.Hash, len(providerRegistry))
+		info.hasUnrestoredProvider = make([]bool, len(providerRegistry))
+		for _, provider := range data.ProviderHashes {
+			info.hasUnrestoredProvider[provider.Id.id] = true
+			info.providerInitialValueHashes[provider.Id.id] = provider.Hash
 		}
 	}
 }
@@ -3800,9 +3808,11 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 					var providerHashes []proptools.Hash
 					if providerRegistry[i].mutator == singletonTag {
 						c.VisitAllSingletons(func(s SingletonProxy) {
+							hash := proptools.ZeroHash
 							if s.singleton.providerInitialValueHashes != nil {
-								providerHashes = append(providerHashes, s.singleton.providerInitialValueHashes[i])
+								hash = s.singleton.providerInitialValueHashes[i]
 							}
+							providerHashes = append(providerHashes, hash)
 						})
 					}
 					var err error
@@ -4598,6 +4608,15 @@ func (c *Context) SingletonName(singleton Singleton) string {
 		}
 	}
 	return ""
+}
+
+func (c *Context) singletonByName(name string) *singletonInfo {
+	for _, s := range c.singletonInfo {
+		if s.name == name {
+			return s
+		}
+	}
+	return nil
 }
 
 // Checks that the hashes of all the providers match the hashes from when they were first set.
