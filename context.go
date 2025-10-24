@@ -19,9 +19,11 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/fnv"
 	"io"
 	"io/ioutil"
@@ -186,6 +188,7 @@ type Context struct {
 	orderOnlyStrings        syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
 	incrementalDebugFile    string
 	EncContext              gobtools.EncContext
+	providerValueHashes     []uint64
 
 	moduleDebugDataChannel chan []byte
 
@@ -401,8 +404,7 @@ type moduleInfo struct {
 	actionDefs  localBuildActions
 	buildParams *[]BuildParams
 
-	providers                  []interface{}
-	providerInitialValueHashes []uint64
+	providerInfo
 
 	startedMutator  int
 	finishedMutator int
@@ -418,8 +420,16 @@ type moduleInfo struct {
 	cachedName string
 	// cachedString stores the result of Module.String() after the end of GenerateBuildActions for use in ModuleProxy.String().
 	cachedString string
+	// cachedUniqueName stores the result of UniqueName after the end of GenerateBuildActions for use when sorting
+	// modules.
+	cachedUniqueName string
 
 	incrementalInfo
+}
+
+type providerInfo struct {
+	providers                  []interface{}
+	providerInitialValueHashes []uint64
 }
 
 // @auto-generate: gob
@@ -601,6 +611,10 @@ type singletonInfo struct {
 
 	// set during PrepareBuildActions
 	actionDefs localBuildActions
+	providerInfo
+	startedGenerateBuildActions  bool
+	finishedGenerateBuildActions bool
+	incrementalSupported         bool
 }
 
 type mutatorInfo struct {
@@ -3457,6 +3471,8 @@ func (c *Context) generateModuleBuildActions(config interface{},
 				mctx.module.propertyPos = nil
 			}
 
+			module.cachedUniqueName = uniqueName
+
 			newErrs := c.processLocalBuildActions(&module.actionDefs,
 				&mctx.actionDefs, liveGlobals)
 			if len(newErrs) > 0 {
@@ -3513,12 +3529,15 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 	scope := newLocalScope(nil, singletonNamespacePrefix(info.name))
 
 	sctx := &singletonContext{
-		name:    info.name,
-		context: c,
-		config:  config,
-		scope:   scope,
-		globals: liveGlobals,
+		singleton:    info,
+		context:      c,
+		config:       config,
+		scope:        scope,
+		globals:      liveGlobals,
+		depProviders: make(map[int]bool),
 	}
+
+	info.startedGenerateBuildActions = true
 
 	func() {
 		defer func() {
@@ -3532,8 +3551,29 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 				}
 			}
 		}()
-		info.singleton.GenerateBuildActions(sctx)
+
+		cacheKey, restored := c.restoreSingleton(info)
+		if !restored {
+			info.singleton.GenerateBuildActions(sctx)
+		}
+		// A caching entry for singletons is only written if the singleton
+		// depends on at least one provider. If zero providers are consumed,
+		// the cache restore process would fail to locate
+		// a cache entry, forcing the singleton to re-execute on every build.
+		//
+		// An edge case where a coding change removes a provider dependency is safely handled
+		// because any detected code change automatically invalidates the entire global cache,
+		// ensuring system consistency.
+		if cacheKey != nil && !restored && len(sctx.depProviders) > 0 {
+			cache := make(map[int]uint64)
+			for k, _ := range sctx.depProviders {
+				cache[k] = c.providerValueHashes[k]
+			}
+			c.buildActionsCache.writeSingletonBuildAction(c.EncContext, cacheKey, &SingletonActionCachedData{ProviderHashes: cache})
+		}
 	}()
+
+	info.finishedGenerateBuildActions = true
 
 	if len(sctx.errs) > 0 {
 		errs = append(errs, sctx.errs...)
@@ -3546,6 +3586,37 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 		&sctx.actionDefs, liveGlobals)
 	errs = append(errs, newErrs...)
 	return deps, errs
+}
+
+func (c *Context) restoreSingleton(info *singletonInfo) (*BuildActionCacheKey, bool) {
+	var cacheKey *BuildActionCacheKey
+	restored := false
+	info.incrementalSupported = c.GetIncrementalEnabled() && info.singleton.IncrementalSupported()
+	if info.incrementalSupported {
+		cacheKey = &BuildActionCacheKey{
+			Id: info.name,
+		}
+		// We can pursue a incremental analysis because there is no soong coding change, no
+		// product config and env variable changes.
+		if c.GetIncrementalAnalysis() {
+			data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, cacheKey)
+			if err != nil {
+				panic(err)
+			}
+			if data != nil {
+				// This logic here assumes a singleton's behavior is a pure function of its providers.
+				// Conditional access to certain providers must also be based on other provider
+				// values, ensuring that any behavioral change is captured by the input providers hashes.
+				restored = len(data.ProviderHashes) != 0
+				for k, v := range data.ProviderHashes {
+					if c.providerValueHashes[k] != v {
+						restored = false
+					}
+				}
+			}
+		}
+	}
+	return cacheKey, restored
 }
 
 func (c *Context) generateParallelSingletonBuildActions(config interface{},
@@ -3599,6 +3670,35 @@ func (c *Context) generateParallelSingletonBuildActions(config interface{},
 	return deps, errs
 }
 
+func (c *Context) calculateProvidersHashes() {
+	hashers := make([]hash.Hash64, len(providerRegistry))
+	var wg sync.WaitGroup
+	for i := range hashers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 8)
+			hashers[i] = fnv.New64()
+			// For singleton providers we collect provider hashes from singletons.
+			if providerRegistry[i].mutator == singletonTag {
+				c.VisitAllSingletons(func(s SingletonProxy) {
+					binary.BigEndian.PutUint64(buf, s.singleton.providerInitialValueHashes[i])
+					hashers[i].Write(buf)
+				})
+			} else {
+				c.visitAllModuleInfos(func(m *moduleInfo) {
+					binary.BigEndian.PutUint64(buf, m.providerInitialValueHashes[i])
+					hashers[i].Write(buf)
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	for i := range hashers {
+		c.providerValueHashes = append(c.providerValueHashes, hashers[i].Sum64())
+	}
+}
+
 func (c *Context) generateSingletonBuildActions(config interface{},
 	singletons []*singletonInfo, liveGlobals *liveTracker) ([]string, []error) {
 
@@ -3620,6 +3720,10 @@ func (c *Context) generateSingletonBuildActions(config interface{},
 	// Force a resort of the module groups before running singletons so that two singletons running in parallel
 	// don't cause a data race when they trigger a resort in VisitAllModules.
 	c.sortedModuleGroups()
+
+	if c.GetIncrementalEnabled() {
+		c.calculateProvidersHashes()
+	}
 
 	// First, take care of any singletons that want to run in parallel.
 	deps, errs = c.generateParallelSingletonBuildActions(config, singletons, liveGlobals)
@@ -4206,6 +4310,24 @@ func (c *Context) VisitDirectDepsProxies(module ModuleOrProxy, visit func(Module
 	}
 }
 
+func (c *Context) VisitDirectDepsProxiesWithTags(module ModuleOrProxy, visit func(ModuleProxy, DependencyTag)) {
+	topModule := module.info()
+
+	var visiting *moduleInfo
+
+	defer func() {
+		if r := recover(); r != nil {
+			panic(newPanicErrorf(r, "VisitDirectDepsProxies(%s, %s) for dependency %s",
+				topModule, funcName(visit), visiting))
+		}
+	}()
+
+	for _, dep := range topModule.directDeps {
+		visiting = dep.module
+		visit(ModuleProxy{dep.module}, dep.tag)
+	}
+}
+
 func (c *Context) VisitDirectDepsWithTags(module Module, visit func(Module, DependencyTag)) {
 	topModule := module.info()
 
@@ -4344,6 +4466,24 @@ func (c *Context) VisitAllModuleVariantProxies(module ModuleProxy, visit func(Mo
 	})
 }
 
+func (c *Context) VisitAllSingletons(visit func(singleton SingletonProxy)) {
+	var singleton *singletonInfo
+
+	defer func() {
+		if r := recover(); r != nil {
+			panic(newPanicErrorf(r, "VisitAllSingletons(%s) for %s",
+				funcName(visit), singleton.name))
+		}
+	}()
+
+	for _, singleton = range c.singletonInfo {
+		// Only return the finished ones
+		if singleton.finishedGenerateBuildActions {
+			visit(SingletonProxy{singleton: singleton})
+		}
+	}
+}
+
 func (c *Context) ModuleToProxy(module ModuleOrProxy) ModuleProxy {
 	return ModuleProxy{module.info()}
 }
@@ -4385,51 +4525,27 @@ func (c *Context) VerifyProvidersWereUnchanged() []error {
 	if !c.buildActionsReady {
 		return []error{ErrBuildActionsNotReady}
 	}
-	toProcess := make(chan *moduleInfo)
-	errorCh := make(chan []error)
-	var wg sync.WaitGroup
-	go func() {
-		for m := range c.iterateAllVariants() {
-			toProcess <- m
-		}
-		close(toProcess)
-	}()
-	for i := 0; i < 1000; i++ {
-		wg.Add(1)
-		go func() {
-			var errors []error
-			for m := range toProcess {
-				for i, provider := range m.providers {
-					if provider != nil {
-						hash, err := proptools.CalculateHash(provider)
-						if err != nil {
-							errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set, and no longer hashable afterwards: %s", providerRegistry[i].typ, m.Name(), err.Error()))
-							continue
-						}
-						if m.providerInitialValueHashes[i] != hash {
-							errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
-						}
-					} else if m.providerInitialValueHashes[i] != 0 {
-						// This should be unreachable, because in setProvider we check if the provider has already been set.
-						errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
-					}
-				}
-			}
-			if errors != nil {
-				errorCh <- errors
-			}
-			wg.Done()
-		}()
-	}
-	go func() {
-		wg.Wait()
-		close(errorCh)
-	}()
 
-	var errors []error
-	for newErrors := range errorCh {
-		errors = append(errors, newErrors...)
-	}
+	errors := parallelVisitSimple(c.iterateAllVariants(), 1000, func(m *moduleInfo, _ int) []error {
+		var errors []error
+		for i, provider := range m.providers {
+			if provider != nil {
+				hash, err := proptools.CalculateHash(provider)
+				if err != nil {
+					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set, and no longer hashable afterwards: %s", providerRegistry[i].typ, m.Name(), err.Error()))
+					continue
+				}
+				if m.providerInitialValueHashes[i] != hash {
+					errors = append(errors, fmt.Errorf("provider %q on module %q was modified after being set", providerRegistry[i].typ, m.Name()))
+				}
+			} else if m.providerInitialValueHashes[i] != 0 {
+				// This should be unreachable, because in setProvider we check if the provider has already been set.
+				errors = append(errors, fmt.Errorf("provider %q on module %q was unset somehow, this is an internal error", providerRegistry[i].typ, m.Name()))
+			}
+		}
+		return errors
+	})
+
 	return errors
 }
 
@@ -4710,19 +4826,6 @@ func (s depSorter) Swap(i, j int) {
 	s.deps[i], s.deps[j] = s.deps[j], s.deps[i]
 }
 
-type moduleSorter struct {
-	modules       []*moduleInfo
-	nameInterface NameInterface
-}
-
-func (s moduleSorter) Len() int {
-	return len(s.modules)
-}
-
-func (s moduleSorter) Less(i, j int) bool {
-	return moduleLess(s.modules[i], s.modules[j], s.nameInterface)
-}
-
 func moduleLess(iMod, jMod *moduleInfo, nameInterface NameInterface) bool {
 	iName := nameInterface.UniqueName(newNamespaceContext(iMod), iMod.group.name)
 	jName := nameInterface.UniqueName(newNamespaceContext(jMod), jMod.group.name)
@@ -4738,10 +4841,6 @@ func moduleLess(iMod, jMod *moduleInfo, nameInterface NameInterface) bool {
 	} else {
 		return iName < jName
 	}
-}
-
-func (s moduleSorter) Swap(i, j int) {
-	s.modules[i], s.modules[j] = s.modules[j], s.modules[i]
 }
 
 func GetNinjaShardFiles(ninjaFile string) []string {
@@ -4773,8 +4872,24 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 		}
 		modules = append(modules, module)
 	}
-	sort.Sort(moduleSorter{modules, c.nameInterface})
-	sort.Sort(moduleSorter{incModules, c.nameInterface})
+
+	// cachedNameModuleLess is similar to moduleLess, but uses the namespaced name cached in
+	// moduleInfo.uniqueName instead of recomputing it each time.
+	cachedNameModuleLess := func(a, b *moduleInfo) int {
+		if a.cachedUniqueName == b.cachedUniqueName {
+			if a.variant.name == b.variant.name {
+				panic(fmt.Sprintf("duplicate module name: %s %s: %#v and %#v\n",
+					a.cachedUniqueName, a.variant.name, a.variant.variations, a.variant.variations))
+			} else {
+				return cmp.Compare(a.variant.name, b.variant.name)
+			}
+		} else {
+			return cmp.Compare(a.cachedUniqueName, b.cachedUniqueName)
+		}
+	}
+
+	slices.SortFunc(modules, cachedNameModuleLess)
+	slices.SortFunc(incModules, cachedNameModuleLess)
 
 	phonys := c.deduplicateOrderOnlyDeps(append(modules, incModules...))
 
@@ -4849,12 +4964,12 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				parallelVisit(slices.Values(incModules), unorderedVisitorImpl{}, parallelVisitLimit,
-					func(m *moduleInfo, pause pauseFunc) bool {
+				parallelVisitSimple(slices.Values(incModules), parallelVisitLimit,
+					func(m *moduleInfo, _ int) []error {
 						if !m.incrementalRestored {
 							c.cacheModuleBuildActions(m)
 						}
-						return false
+						return nil
 					})
 			}()
 		}
@@ -4881,6 +4996,48 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 	}
 }
 
+// A simplified version of parallelVisit where multiple calls to it can be run at the same time.
+func parallelVisitSimple(moduleIter iter.Seq[*moduleInfo], limit int, visit func(module *moduleInfo, idx int) []error) []error {
+	type moduleToProcess struct {
+		module *moduleInfo
+		index  int
+	}
+	toProcess := make(chan moduleToProcess)
+	errorCh := make(chan []error)
+	var wg sync.WaitGroup
+	go func() {
+		idx := 0
+		for m := range moduleIter {
+			toProcess <- moduleToProcess{m, idx}
+			idx++
+		}
+		close(toProcess)
+	}()
+	for i := 0; i < limit; i++ {
+		wg.Add(1)
+		go func() {
+			var errors []error
+			for m := range toProcess {
+				errors = append(errors, visit(m.module, m.index)...)
+			}
+			if len(errors) > 0 {
+				errorCh <- errors
+			}
+			wg.Done()
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(errorCh)
+	}()
+
+	var errors []error
+	for newErrors := range errorCh {
+		errors = append(errors, newErrors...)
+	}
+	return errors
+}
+
 func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo, headerTemplate *template.Template) error {
 	c.BeginEvent("write_incremental_modules")
 	defer c.EndEvent("write_incremental_modules")
@@ -4893,28 +5050,71 @@ func writeIncrementalModules(c *Context, baseFile string, modules []*moduleInfo,
 	defer baseBuf.Flush()
 	baseWriter := newNinjaWriter(baseBuf)
 
-	if c.GetIncrementalEnabled() {
-		inMemoryWriter := bytes.NewBuffer(nil)
+	// Use a sync.Pool to reuse buffers and reduce memory allocations.
+	bufferPool := sync.Pool{
+		New: func() any {
+			// Pre-allocate a reasonably sized buffer for each new writer.
+			return bytes.NewBuffer(make([]byte, 0, 128*1024))
+		},
+	}
+	headerBufPool := sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+	writeSignals := make([]chan struct{}, len(modules))
+	for i := range writeSignals {
+		writeSignals[i] = make(chan struct{})
+	}
+
+	errs := parallelVisitSimple(slices.Values(modules), parallelVisitLimit, func(m *moduleInfo, idx int) []error {
 		var moduleBytes []byte
-		buf := bytes.NewBuffer(nil)
-		for _, module := range modules {
-			if !module.incrementalRestored {
-				inMemoryWriter.Reset()
-				mWriter := newNinjaWriter(inMemoryWriter)
-				if err := c.writeOneModuleAction(module, mWriter, headerTemplate, buf); err != nil {
-					return err
+		var err error
+
+		if m.incrementalRestored {
+			// Read from the cache if the module is restored.
+			moduleBytes, err = c.buildActionsCache.readNinjaStatements(m.buildActionCacheKey)
+		} else {
+			// Generate statements for dirty modules.
+			inMemoryWriter := bufferPool.Get().(*bytes.Buffer)
+			inMemoryWriter.Reset()
+			defer bufferPool.Put(inMemoryWriter)
+
+			headerBuf := headerBufPool.Get().(*bytes.Buffer)
+			headerBuf.Reset()
+			defer headerBufPool.Put(headerBuf)
+
+			mWriter := newNinjaWriter(inMemoryWriter)
+			err = c.writeOneModuleAction(m, mWriter, headerTemplate, headerBuf)
+			if err == nil {
+				// Make a copy of the bytes, as the buffer will be reused.
+				moduleBytes = slices.Clone(inMemoryWriter.Bytes())
+				// Write the newly generated statements back to the cache when in incremental mode.
+				if c.GetIncrementalEnabled() {
+					err = c.buildActionsCache.writeNinjaStatements(m.buildActionCacheKey, moduleBytes)
 				}
-				moduleBytes = inMemoryWriter.Bytes()
-				c.buildActionsCache.writeNinjaStatements(c.EncContext, module.buildActionCacheKey, moduleBytes)
-			} else if moduleBytes, err = c.buildActionsCache.readNinjaStatements(c.EncContext, module.buildActionCacheKey); err != nil {
-				return err
 			}
+		}
+
+		// Wait for the signal from the previous thread before writing even when an
+		// error happens to ensure no concurrently writing of the ninja file.
+		if idx > 0 {
+			<-writeSignals[idx-1]
+		}
+
+		if err == nil {
 			baseWriter.writer.Write(moduleBytes)
 		}
+
+		// Signal the next thread that it's clear to write.
+		close(writeSignals[idx])
+		if err != nil {
+			return []error{err}
+		}
 		return nil
-	} else {
-		return c.writeModuleAction(modules, baseWriter, headerTemplate)
+	})
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
+	return nil
 }
 
 func (c *Context) writeModuleAction(modules []*moduleInfo, nw *ninjaWriter, headerTemplate *template.Template) error {
@@ -5124,7 +5324,7 @@ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 		}
 	}
 
-	buildActionData := BuildActionCachedData{
+	buildActionData := ModuleActionCachedData{
 		InputHash:        module.buildActionInputHash,
 		ProviderHashes:   providerHashes,
 		OrderOnlyStrings: module.orderOnlyStrings,
@@ -5135,7 +5335,7 @@ func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
 		Providers: providers,
 	}
 
-	err := errors.Join(c.buildActionsCache.writeBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData),
+	err := errors.Join(c.buildActionsCache.writeModuleBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData),
 		c.buildActionsCache.writeProviders(c.EncContext, module.buildActionCacheKey, &providersData))
 	if err != nil {
 		panic(err)

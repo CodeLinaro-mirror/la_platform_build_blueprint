@@ -1623,7 +1623,7 @@ func incrementalSetupForRestore(ctx *Context, orderOnlyStrings []string) any {
 	cacheKey, hash := calculateHashKey(incInfo, [][]uint64{providerHashes})
 	var providerValue any = IncrementalTestProvider{Value: "MyIncrementalModule"}
 	providerHash, _ := proptools.CalculateHash(providerValue)
-	ctx.buildActionsCache.writeBuildAction(ctx.EncContext, &cacheKey, &BuildActionCachedData{
+	ctx.buildActionsCache.writeModuleBuildAction(ctx.EncContext, &cacheKey, &ModuleActionCachedData{
 		InputHash: hash,
 		ProviderHashes: []ProviderHash{{
 			Id:   &IncrementalTestProviderKey.providerKey,
@@ -1638,7 +1638,7 @@ func incrementalSetupForRestore(ctx *Context, orderOnlyStrings []string) any {
 			Value: &providerValue,
 		}},
 	})
-	ctx.buildActionsCache.writeNinjaStatements(ctx.EncContext, &cacheKey, []byte(incrementalModuleNinja))
+	ctx.buildActionsCache.writeNinjaStatements(&cacheKey, []byte(incrementalModuleNinja))
 	ctx.SetIncrementalEnabled(true)
 	ctx.SetIncrementalAnalysis(true)
 
@@ -1650,7 +1650,7 @@ func calculateHashKey(m *moduleInfo, providerHashes [][]uint64) (BuildActionCach
 	if err != nil {
 		panic(newPanicErrorf(err, "failed to calculate properties hash"))
 	}
-	cacheInput := new(BuildActionCacheInput)
+	cacheInput := new(ModuleBuildActionCacheInput)
 	cacheInput.PropertiesHash = hash
 	cacheInput.ProvidersHash = providerHashes
 	hash, err = proptools.CalculateHash(cacheInput)
@@ -1703,7 +1703,7 @@ func TestCacheBuildActions(t *testing.T) {
 	//	t.Errorf("build actions are not cached for the incremental module")
 	//}
 	cacheKey, hash := calculateHashKey(incInfo, [][]uint64{barInfo.providerInitialValueHashes})
-	cache, err := ctx.buildActionsCache.readBuildAction(ctx.EncContext, &cacheKey)
+	cache, err := ctx.buildActionsCache.readModuleBuildAction(ctx.EncContext, &cacheKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
@@ -1712,7 +1712,7 @@ func TestCacheBuildActions(t *testing.T) {
 	}
 	var providerValue any = IncrementalTestProvider{Value: "MyIncrementalModule"}
 	providerHash, _ := proptools.CalculateHash(providerValue)
-	expectedCache := BuildActionCachedData{
+	expectedCache := ModuleActionCachedData{
 		InputHash: hash,
 		ProviderHashes: []ProviderHash{{
 			Id:   &IncrementalTestProviderKey.providerKey,
@@ -1742,7 +1742,7 @@ func TestCacheBuildActions(t *testing.T) {
 		t.Errorf("expected: %v actual %v", expectedProviders, *providers)
 	}
 
-	ninja, err := ctx.buildActionsCache.readNinjaStatements(ctx.EncContext, &cacheKey)
+	ninja, err := ctx.buildActionsCache.readNinjaStatements(&cacheKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
@@ -2114,7 +2114,7 @@ func verifyOrderOnlyStringsCache(t *testing.T, ctx *Context, incInfo, barInfo *m
 	// Verify that the dedup-* order only strings used by MyIncrementalModule is
 	// cached along with its other cached values
 	cacheKey, _ := calculateHashKey(incInfo, [][]uint64{barInfo.providerInitialValueHashes})
-	cache, err := ctx.buildActionsCache.readBuildAction(ctx.EncContext, &cacheKey)
+	cache, err := ctx.buildActionsCache.readModuleBuildAction(ctx.EncContext, &cacheKey)
 	if err != nil {
 		t.Fatalf("read failed with an error: %s", err)
 	}
@@ -2296,5 +2296,130 @@ func Benchmark_parallelVisit(b *testing.B) {
 		})
 	if errs != nil {
 		b.Errorf("expected no errors, got %q", errs)
+	}
+}
+
+type singletonNameInfo struct {
+	name string
+}
+
+var singletonNameInfoProvider = NewSingletonProvider[singletonNameInfo]()
+
+type sequentialSingleton struct {
+	GenerateBuildActionsCalled int
+}
+
+func (s *sequentialSingleton) GenerateBuildActions(ctx SingletonContext) {
+	s.GenerateBuildActionsCalled++
+	ctx.VisitAllSingletons(func(singleton SingletonProxy) {
+		ctx.OtherSingletonProvider(singleton, singletonNameInfoProvider)
+	})
+	ctx.VisitAllModules(func(module Module) {
+		ctx.ModuleProvider(module, IncrementalTestProviderKey)
+	})
+}
+
+func (s *sequentialSingleton) IncrementalSupported() bool {
+	return true
+}
+
+func sequentialSingletonFactory() Singleton {
+	return &sequentialSingleton{}
+}
+
+type parallelSingleton struct {
+	name string
+}
+
+func (s *parallelSingleton) GenerateBuildActions(ctx SingletonContext) {
+	ctx.SetSingletonProvider(singletonNameInfoProvider, singletonNameInfo{name: s.name})
+}
+
+func newParallelSingletonFactory(name string) func() Singleton {
+	return func() Singleton {
+		return &parallelSingleton{
+			name: name,
+		}
+	}
+}
+
+func (s *parallelSingleton) IncrementalSupported() bool {
+	return true
+}
+
+const parallelSingletonName = "parallel_singleton"
+const sequentialSingletonName = "sequential_singleton"
+
+func singletonCacheSetup(t *testing.T) *Context {
+	bp := `
+			foo_module {
+					name: "MyFooModule",
+					outputs: ["MyFooModule_phony_output"],
+			}
+		`
+	ctx := bpSetup(t, bp)
+	ctx.RegisterSingletonType(parallelSingletonName, newParallelSingletonFactory(parallelSingletonName), true)
+	ctx.RegisterSingletonType(sequentialSingletonName, sequentialSingletonFactory, false)
+
+	cache := &BuildActionCache{}
+	if err := cache.openForTests(); err != nil {
+		t.Fatalf("failed to open cache: %s", err)
+	}
+	ctx.buildActionsCache = cache
+
+	ctx.SetIncrementalEnabled(true)
+	ctx.SetIncrementalAnalysis(true)
+	return ctx
+}
+
+func TestSingletonCache(t *testing.T) {
+	ctx := singletonCacheSetup(t)
+
+	_, errs := ctx.PrepareBuildActions(nil)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	singleton := ctx.singletonInfo[1].singleton.(*sequentialSingleton)
+
+	// 1. Verify GenerateBuildActions was called
+	if singleton.GenerateBuildActionsCalled != 1 {
+		t.Errorf("expected GenerateBuildActions to be called once, got %d", singleton.GenerateBuildActionsCalled)
+	}
+
+	// 2. Verify cache entry was written
+	cacheKey := &BuildActionCacheKey{Id: sequentialSingletonName}
+	data, err := ctx.buildActionsCache.readSingletonBuildAction(ctx.EncContext, cacheKey)
+	if err != nil {
+		t.Fatalf("failed to read cache: %v", err)
+	}
+	if data == nil || len(data.ProviderHashes) != 2 {
+		t.Errorf("expected cache entry to be written with 2 provider hashes, got nil or %d hashes", len(data.ProviderHashes))
+	}
+}
+func TestSingletonRestore(t *testing.T) {
+	ctx := singletonCacheSetup(t)
+	_, errs := ctx.PrepareBuildActions(nil)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+
+	cacheKey := &BuildActionCacheKey{Id: sequentialSingletonName}
+	data, err := ctx.buildActionsCache.readSingletonBuildAction(ctx.EncContext, cacheKey)
+	if err != nil {
+		t.Fatalf("failed to read cache: %v", err)
+	}
+
+	ctx = singletonCacheSetup(t)
+	ctx.buildActionsCache.writeSingletonBuildAction(ctx.EncContext, cacheKey, data)
+
+	_, errs = ctx.PrepareBuildActions(nil)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected errors: %v", errs)
+	}
+	singleton := ctx.singletonInfo[1].singleton.(*sequentialSingleton)
+
+	// 1. Verify GenerateBuildActions was called
+	if singleton.GenerateBuildActionsCalled != 0 {
+		t.Errorf("expected GenerateBuildActions to be not called, got %d", singleton.GenerateBuildActionsCalled)
 	}
 }
