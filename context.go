@@ -358,8 +358,7 @@ func (l moduleList) lastModule() *moduleInfo {
 }
 
 type moduleGroup struct {
-	name      string
-	ninjaName string
+	name string
 
 	modules moduleList
 
@@ -484,10 +483,8 @@ type commonIncrementalInfo struct {
 	// (indexed in the same order as providerRegistry) exists in the cache but has not yet been
 	// restored.
 	hasUnrestoredProvider []bool
-	// Whether this module support incremental build.
-	incrementalSupported bool
-	providerRestoreLock  sync.Mutex
-	buildActionCacheKey  *BuildActionCacheKey
+	providerRestoreLock   sync.Mutex
+	buildActionCacheKey   *BuildActionCacheKey
 	providerInfo
 }
 
@@ -530,7 +527,7 @@ func (module *moduleInfo) namespace() Namespace {
 	return module.group.namespace
 }
 
-func (module *moduleInfo) ModuleCacheKey() string {
+func (module *moduleInfo) moduleCacheKey() string {
 	variant := module.variant.name
 	if variant == "" {
 		variant = "none"
@@ -653,6 +650,8 @@ type singletonInfo struct {
 	startedGenerateBuildActions  bool
 	finishedGenerateBuildActions bool
 	commonIncrementalInfo
+	// Whether this singleton supports incremental build.
+	incrementalSupported bool
 	// The provider hashes of all the singletons that this singleton might depend on.
 	// These values are calculated before calling the GenerateBuildAction of the current
 	// singleton, and combined with the hashes of all the module providers that this
@@ -3483,7 +3482,7 @@ func (c *Context) generateModuleBuildActions(config interface{},
 				mctx.evaluator = nil
 			}()
 
-			mctx.module.startedGenerateBuildActions = true
+			module.startedGenerateBuildActions = true
 
 			func() {
 				defer func() {
@@ -3497,12 +3496,12 @@ func (c *Context) generateModuleBuildActions(config interface{},
 						}
 					}
 				}()
-				if !mctx.restoreModuleBuildActions() || c.incrementalProviderTest {
-					mctx.module.logicModule.GenerateBuildActions(mctx)
+				if !module.restoreModuleBuildActions(c) || c.incrementalProviderTest {
+					module.logicModule.GenerateBuildActions(mctx)
 				}
 			}()
 
-			mctx.module.finishedGenerateBuildActions = true
+			module.finishedGenerateBuildActions = true
 
 			if len(mctx.errs) > 0 {
 				errsCh <- mctx.errs
@@ -3520,18 +3519,18 @@ func (c *Context) generateModuleBuildActions(config interface{},
 
 			depsCh <- mctx.ninjaFileDeps
 
-			if mctx.module.freeAfterGenerateBuildActions {
+			if module.freeAfterGenerateBuildActions {
 				// This module is freed after GenerateBuildActions complete, requiring all future accesses
 				// to go through ModuleProxy instead of the Module.
 				// Cache Module.Name() and Module.String() for future use in ModuleProxy.Name() and ModuleProxy.String()
-				mctx.module.cachedName = mctx.module.logicModule.Name()
-				mctx.module.cachedString = mctx.module.logicModule.String()
+				module.cachedName = module.logicModule.Name()
+				module.cachedString = module.logicModule.String()
 				// When soong debug data is requested, don't remove these info, they will show up in soong-debug-info.json.
 				if c.moduleDebugDataChannel == nil {
 					// TODO: logicModule is needed to evaluate configurable properties, we should figure out an alternative.
-					mctx.module.logicModule = nil
-					mctx.module.properties = nil
-					mctx.module.propertyPos = nil
+					module.logicModule = nil
+					module.properties = nil
+					module.propertyPos = nil
 				}
 			}
 
@@ -5094,8 +5093,8 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 				defer wg.Done()
 				parallelVisitSimple(slices.Values(modules), parallelVisitLimit,
 					func(m *moduleInfo, _ int) []error {
-						if m.incrementalSupported && !m.incrementalRestored {
-							c.cacheModuleBuildActions(m)
+						if !m.incrementalRestored {
+							m.cacheModuleBuildActions(c.EncContext, c.buildActionsCache)
 						}
 						return nil
 					})
@@ -5437,40 +5436,6 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 		})
 
 	return &localBuildActions{buildDefs: phonys}
-}
-
-func (c *Context) cacheModuleBuildActions(module *moduleInfo) {
-	var providerHashes []ProviderHash
-
-	for i, p := range module.providers {
-		if p != nil && providerRegistry[i].mutator == "" {
-			err := c.buildActionsCache.writeProvider(c.EncContext, module.providerInitialValueHashes[i],
-				CachedProvider{
-					Id:    providerRegistry[i],
-					Value: p,
-				})
-			if err != nil {
-				panic(err)
-			}
-			providerHashes = append(providerHashes,
-				ProviderHash{
-					Id:   providerRegistry[i],
-					Hash: module.providerInitialValueHashes[i],
-				})
-		}
-	}
-
-	buildActionData := ModuleActionCachedData{
-		InputHash:        module.buildActionInputHash,
-		ProviderHashes:   providerHashes,
-		OrderOnlyStrings: module.orderOnlyStrings,
-		GlobCache:        module.globCache,
-	}
-
-	err := c.buildActionsCache.writeModuleBuildAction(c.EncContext, module.buildActionCacheKey, &buildActionData)
-	if err != nil {
-		panic(err)
-	}
 }
 
 func (c *Context) writeLocalBuildActions(nw *ninjaWriter,
