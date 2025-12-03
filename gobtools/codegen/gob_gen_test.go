@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unique"
 
 	"github.com/google/blueprint/depset"
 	"github.com/google/blueprint/gobtools"
@@ -128,6 +129,14 @@ func TestEncDec(t *testing.T) {
 				f36:          TestGeneric[int32]{t: 12345},
 				TestEmbedPtr: &TestEmbedPtr{f37: "mmmmmmmm"},
 				f38:          test.TypeBasic(1),
+				f39:          [2]uint64{1, 2},
+				f40: map[[1]string]map[int][]*bool{
+					{"llllllll"}: {
+						1: {boolPtr(true)},
+					},
+				},
+				f41: unique.Make(TestEcho{"aaaaaa"}),
+				f42: unique.Make(TestEcho{"aaaaaa"}),
 			},
 			decoded: &TestStruct{},
 		},
@@ -208,11 +217,15 @@ func TestGenerate(t *testing.T) {
 	g.sourceDir = parts[0]
 
 	sourceFile := "gob_test_data.go"
-	expectedOutputFile := "gob_test_data_gob_enc.go"
+	expectedOutputFile := "main_enc.go"
 
-	generatedBytes, err := g.generate(sourceFile)
+	generatedBytes, outputFile, err := g.generate(sourceFile, nil, false)
 	if err != nil {
 		t.Fatalf("g.generate() failed for %s: %v", sourceFile, err)
+	}
+
+	if outputFile != expectedOutputFile {
+		t.Fatalf("output file is different from the expected: %s %s", outputFile, expectedOutputFile)
 	}
 
 	expectedBytes, err := os.ReadFile(expectedOutputFile)
@@ -224,4 +237,8 @@ func TestGenerate(t *testing.T) {
 		t.Errorf("Generated code from %s does not match expected output in %s.\nexpected:\n%s\ngot:\n%s",
 			sourceFile, expectedOutputFile, expectedBytes, generatedBytes)
 	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
 }

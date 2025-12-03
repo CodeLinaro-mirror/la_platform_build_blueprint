@@ -116,6 +116,20 @@ func NewMutatorProvider[K any](mutator string) ProviderKey[K] {
 	return provider
 }
 
+func ProviderType(id int) string {
+	if id >= 0 && id < len(providerRegistry) {
+		return providerRegistry[id].typ
+	}
+	return "unknown"
+}
+
+func ProviderMutator(id int) string {
+	if id >= 0 && id < len(providerRegistry) {
+		return providerRegistry[id].mutator
+	}
+	return "unknown"
+}
+
 // initProviders fills c.providerMutators with the *mutatorInfo associated with each provider ID,
 // if any.
 func (c *Context) initProviders() {
@@ -136,6 +150,12 @@ func (c *Context) initProviders() {
 // Once Go has generics the value parameter can be typed:
 // setProvider(type T)(m *moduleInfo, provider ProviderKey(T), value T)
 func (c *Context) setProvider(m *moduleInfo, provider *providerKey, value any) {
+	if m.incrementalRestored {
+		if c.incrementalProviderTest {
+			return
+		}
+		panic("shouldn't set provider after the module was restored from cache")
+	}
 	if provider.mutator == "" {
 		if !m.startedGenerateBuildActions {
 			panic(fmt.Sprintf("Can't set value of provider %s before GenerateBuildActions started",
@@ -162,6 +182,12 @@ func (c *Context) setProvider(m *moduleInfo, provider *providerKey, value any) {
 }
 
 func (c *Context) setSingletonProvider(s *singletonInfo, provider *providerKey, value any) {
+	if s.incrementalRestored {
+		if c.incrementalProviderTest {
+			return
+		}
+		panic("shouldn't set provider after the singleton was restored from cache")
+	}
 	if provider.mutator != singletonTag {
 		panic(fmt.Sprintf("Can't set value of non-singleton provider %s inside singleton %s", provider.typ, s.name))
 	} else {
@@ -193,7 +219,7 @@ func (c *Context) setProviderInternal(info *providerInfo, provider *providerKey,
 	}()
 
 	if info.providerInitialValueHashes == nil {
-		info.providerInitialValueHashes = make([]uint64, len(providerRegistry))
+		info.providerInitialValueHashes = make([]proptools.Hash, len(providerRegistry))
 	}
 	hash, err := proptools.CalculateHash(value)
 	if err != nil {
@@ -227,18 +253,6 @@ func (c *Context) provider(m *moduleInfo, provider *providerKey) (any, bool) {
 func (c *Context) singletonProvider(s *singletonInfo, provider *providerKey) (any, bool) {
 	validateSingletonProvider(s, provider)
 	maybeRestoreProviders(c, &s.commonIncrementalInfo, provider)
-	if s.providerInitialValueHashes == nil {
-		s.providerInitialValueHashes = make([]uint64, len(providerRegistry))
-	}
-	for i, provider := range s.providers {
-		if provider != nil {
-			if hash, err := proptools.CalculateHash(provider); err != nil {
-				panic(err)
-			} else {
-				s.providerInitialValueHashes[i] = hash
-			}
-		}
-	}
 	if len(s.providers) > provider.id {
 		if p := s.providers[provider.id]; p != nil {
 			return p, true
@@ -265,25 +279,25 @@ func maybeRestoreProviders(c *Context, m *commonIncrementalInfo, provider *provi
 		return
 	}
 
-	if m.incrementalRestored && !m.providersRestored {
+	if m.incrementalRestored && m.hasUnrestoredProvider[provider.id] {
 		func() {
 			m.providerRestoreLock.Lock()
 			defer m.providerRestoreLock.Unlock()
-			if !m.providersRestored {
-				providers, err := c.buildActionsCache.readProviders(c.EncContext, m.buildActionCacheKey)
+			if m.hasUnrestoredProvider[provider.id] {
+				p, err := c.buildActionsCache.readProvider(c.EncContext, m.providerInitialValueHashes[provider.id], provider)
 				if err != nil {
 					panic(err)
 				}
 				if m.providers == nil {
 					m.providers = make([]any, len(providerRegistry))
 				}
-				for _, provider := range providers.Providers {
-					if m.providers[provider.Id.id] != nil {
-						panic(fmt.Sprintf("Value of provider %s is already set", provider.Id.typ))
-					}
-					m.providers[provider.Id.id] = *provider.Value
+				if m.providers[provider.id] != nil {
+					panic(fmt.Sprintf("Value of provider %s is already set", provider.typ))
 				}
-				m.providersRestored = true
+				if p.Value != nil {
+					m.providers[provider.id] = p.Value
+				}
+				m.hasUnrestoredProvider[provider.id] = false
 			}
 		}()
 	}
