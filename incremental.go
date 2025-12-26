@@ -31,13 +31,21 @@ import (
 	"github.com/google/blueprint/syncmap"
 )
 
-//go:generate go run gobtools/codegen/gob_gen.go
+//go:generate go run ./gobtools/codegen
 
 const moduleActionsDbName = "module_actions.db"
 const singletonActionsDbName = "singleton_actions.db"
 const providersDbName = "providers.db"
 const referencesDbName = "references.db"
 const ninjaDbName = "ninja.db"
+
+var IncrementalInfoDbNames = []string{
+	moduleActionsDbName,
+	singletonActionsDbName,
+	providersDbName,
+	referencesDbName,
+	ninjaDbName,
+}
 
 // @auto-generate: gob
 type BuildActionCacheKey struct {
@@ -323,18 +331,3 @@ func (b *BuildActionCache) write(ctx gobtools.EncContext, db dbtools.KeyValueSto
 
 // @auto-generate: gob
 type OrderOnlyStringsCache map[string][]string
-
-type ModuleBuildActionCacheInput struct {
-	PropertiesHash proptools.Hash
-	ProvidersHash  [][]proptools.Hash
-}
-
-type Incremental interface {
-	IncrementalSupported() bool
-}
-
-type IncrementalModule struct{}
-
-func (m *IncrementalModule) IncrementalSupported() bool {
-	return true
-}
