@@ -575,13 +575,262 @@ func TestOnDemandDependendcyVariantLeafNode(t *testing.T) {
 	checkTransitionMutate(t, getTransitionModule(ctx, "C", "b1"), "b1_post_transition_bottom_up")
 }
 
-// TODO(b/448182009): Test on demand variant creation for non leaf nodes.
-// The transitive dependencies might also require on demand variants.
+// Test on demand variant creation for non leaf nodes.
+// For B(2), the following deps will be created on demand
+// - C(2), direct dep
+// - C_dep_pre_transition(2), transitive dep
+// - C_dep_post_transition(2), transitive dep
+
+// C_dep_pre_transition_to_1(2) will *not* be created since its incoming_transition is set to 1
 func TestOnDemandDependencyVariantTransitiveDeps(t *testing.T) {
+	t.Parallel()
+	ctx, errs := testTransition(`
+		transition_module {
+			name: "A",
+			split: ["1"],
+			post_transition_deps: ["C"],
+		}
+		transition_module {
+			name: "B",
+			split: ["2"],
+			post_transition_deps: ["C"],
+		}
+		transition_module {
+			name: "B_other",
+			split: ["2"],
+			post_transition_deps: ["C"],
+		}
+		transition_module {
+			name: "C",
+			split: ["1"],
+			split_on_demand: ["2"],
+			deps: [
+			    // For transition variation '2', On-demand variant to On-demand variant.
+			    "C_dep_pre_transition",
+			    // For transition variation '2', On-demand variant to existing split variant.
+			    "C_dep_pre_transition_to_1",
+			],
+			post_transition_deps: [
+			    "C_dep_post_transition",
+			],
+		}
+		transition_module {
+			name: "C_dep_pre_transition",
+			split: ["1"],
+			split_on_demand: ["2"],
+		}
+		transition_module {
+			name: "C_dep_pre_transition_to_1",
+			split: ["1"], // A, B, B_other will all got this variant in its transitive closure.
+			incoming: "1",
+		}
+		transition_module {
+			name: "C_dep_post_transition",
+			split: ["1"],
+			split_on_demand: ["2"],
+		}
+	`)
+	assertNoErrors(t, errs)
+
+	checkTransitionVariants(t, ctx, "A", []string{"1"})
+	checkTransitionVariants(t, ctx, "B", []string{"2"})
+	checkTransitionVariants(t, ctx, "B_other", []string{"2"})
+	checkTransitionVariants(t, ctx, "C", []string{"1", "2"})
+	checkTransitionVariants(t, ctx, "C_dep_pre_transition", []string{"1", "2"})
+	checkTransitionVariants(t, ctx, "C_dep_pre_transition_to_1", []string{"1"})
+	checkTransitionVariants(t, ctx, "C_dep_post_transition", []string{"1", "2"})
+
+	// check deps of on demand variants.
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "1"), "C_dep_pre_transition(1)", "C_dep_pre_transition_to_1(1)", "C_dep_post_transition(1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "2"), "C_dep_pre_transition(2)", "C_dep_pre_transition_to_1(1)", "C_dep_post_transition(2)")
+
+	// check that the transitive on demand variant has been mutated.
+	checkTransitionMutate(t, getTransitionModule(ctx, "C_dep_pre_transition", "1"), "1")
+	checkTransitionMutate(t, getTransitionModule(ctx, "C_dep_pre_transition", "2"), "2")
+	checkTransitionMutate(t, getTransitionModule(ctx, "C_dep_pre_transition_to_1", "1"), "1")
+	checkTransitionMutate(t, getTransitionModule(ctx, "C_dep_post_transition", "1"), "1")
+	checkTransitionMutate(t, getTransitionModule(ctx, "C_dep_post_transition", "2"), "2")
 }
 
-// TODO (b/448182009):
+func TestOnDemandDependencyVariantTransitiveDepsOutgoingTransition(t *testing.T) {
+	t.Parallel()
+	ctx, errs := testTransition(`
+		transition_module {
+			name: "B",
+			split: ["2"],
+			post_transition_deps: ["C"],
+		}
+		transition_module {
+			name: "C",
+			split: ["1"],
+			split_on_demand: ["2"],
+			deps: [
+			    "C_dep_pre_transition",
+			],
+			outgoing: "1",
+		}
+		transition_module {
+			name: "C_dep_pre_transition",
+		}
+	`)
+	assertNoErrors(t, errs)
+
+	checkTransitionVariants(t, ctx, "B", []string{"2"})
+	checkTransitionVariants(t, ctx, "C", []string{"1", "2"})
+	checkTransitionVariants(t, ctx, "C_dep_pre_transition", []string{"", "1"})
+
+	// check deps of on demand variants.
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "1"), "C_dep_pre_transition(1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "2"), "C_dep_pre_transition(1)")
+}
+
+// Create an on demand variant with multiple transitions.
+func TestOnDemandDependendcyVariantMultipleTransitions(t *testing.T) {
+	t.Parallel()
+	ctx, errs := testTransitionCommon(`
+		transition_module {
+			name: "A",
+			split: ["1"],
+		}
+		transition_module {
+			name: "B",
+			split: ["2"],
+		}
+		transition_module {
+			name: "C",
+			split: ["1"],
+			split_on_demand: ["2"],
+		}
+		transition_module {
+			name: "D",
+			split: ["1"],
+			incoming: "1", // Override the transition request of rdeps.
+		}
+	`,
+		false,
+		func(ctx *Context) {
+			// Add a second transition.
+			ctx.RegisterTransitionMutator("transition2", transitionTestMutator{})
+			// Deps mutator that runs after the two transitions.
+			ctx.RegisterBottomUpMutator("post_transition_bottom_up", func(mctx BottomUpMutatorContext) {
+				if mctx.ModuleName() == "A" || mctx.ModuleName() == "B" {
+					mctx.AddDependency(mctx.Module(), nil, "C")
+				}
+				if mctx.ModuleName() == "C" {
+					mctx.AddDependency(mctx.Module(), nil, "D")
+				}
+			})
+		})
+	assertNoErrors(t, errs)
+
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "A", "1_1"), "C(1_1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "B", "2_2"), "C(2_2)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "1_1"), "D(1_1)")
+	checkTransitionDeps(t, ctx, getTransitionModule(ctx, "C", "2_2"), "D(1_1)") // via incoming.
+}
+
+// Check Bottom-up visit in mutator group for on demand variants.
+// e.g. For a mutator group M=[m0,m1,m2], if an on-demand variant is created at m1,
+// m1 of rdep must pause till the mutators have been run on the on-demand variant
+// till m2.
 func TestOnDemandDependencyVariantFromCoalesedMutatorGroup(t *testing.T) {
+	t.Parallel()
+	_, errs := testTransitionCommon(`
+		transition_module {
+			name: "A",
+			split: ["a1"],
+		}
+
+		transition_module {
+			name: "B",
+			split: ["b1"],
+		}
+		transition_module {
+			name: "C",
+			split: ["a1"],
+			split_on_demand: ["b1", "d1"], // b1 has a rdep, d1 does not.
+		}
+	`,
+		false,
+		func(ctx *Context) {
+			// Add a mutator that runs after transition mutator and
+			// uses AddDependency to create an on-demand variant from B->C
+			ctx.RegisterBottomUpMutator("post_transition_bottom_up", func(mctx BottomUpMutatorContext) {
+				if mctx.ModuleName() == "B" {
+					mctx.AddDependency(mctx.Module(), nil, "C")
+					ctx.VisitDirectDeps(mctx.Module(), func(child Module) {
+						c, _ := child.(*transitionModule)
+						if c.properties.Mutated != "b1_post_transition_bottom_up" {
+							mctx.ModuleErrorf("Incorrect mutator visit order in module group: rdep %s visited before mutator group completion for on-demand dep %s\n", mctx.Module().Name(), child.Name())
+						}
+					})
+				}
+			})
+			// Add a mutator that will be coalesced with the previous mutator.
+			// Check that all the mutators have been run on C before B.
+			ctx.RegisterBottomUpMutator("uses_add_dep_from_previous_mutator", func(mctx BottomUpMutatorContext) {
+				if m, ok := mctx.Module().(*transitionModule); ok {
+					m.properties.Mutated += "_post_transition_bottom_up"
+				}
+			})
+
+		})
+	assertNoErrors(t, errs)
+}
+
+// When running the completed mutators on the on-demand variants, the mutator group
+// order must be respected.
+// e.g.
+// For the mutator groups [m0], [m1], [m2, m3]
+// on demand dep A -> B
+// When running m0 on A, A should only have access to B's providers at the end of m0.
+func TestNoPreviewOfFutureStateOfOnDemandVariants(t *testing.T) {
+	t.Parallel()
+	bp := `
+		transition_module {
+			name: "A",
+			split: ["2"],
+			post_transition_deps: ["B"],
+		}
+		transition_module {
+			name: "B",
+			split: ["1"],
+			split_on_demand: ["2"],
+			deps: ["C"],
+		}
+		transition_module {
+			name: "C",
+			split: ["1"],
+			split_on_demand: ["2"],
+		}
+	`
+	ctx := newContext()
+	ctx.MockFileSystem(map[string][]byte{
+		"Android.bp": []byte(bp),
+	})
+	ctx.RegisterBottomUpMutator("deps", depsMutator)
+	ctx.RegisterBottomUpMutator("pre_transition_bottom_up", func(mctx BottomUpMutatorContext) {
+		ctx.VisitDirectDeps(mctx.Module(), func(child Module) {
+			// This should be an error for normal and on-demand variants,
+			// since this provider is set in a future mutator.
+			_, _ = OtherModuleProvider(mctx, child, providerTestMutatorInfoProvider)
+		})
+	})
+	ctx.RegisterTransitionMutator("transition", transitionTestMutator{}).NeverFar()
+	ctx.RegisterBottomUpMutator("provider_mutator", func(mctx BottomUpMutatorContext) {
+		if t, ok := mctx.Module().(*transitionModule); ok {
+			SetProvider(mctx, providerTestMutatorInfoProvider, &providerTestMutatorInfo{
+				Values: []string{t.properties.Mutated},
+			})
+		}
+	})
+	ctx.RegisterBottomUpMutator("post_transition_deps", postTransitionDepsMutator).UsesReverseDependencies()
+	ctx.RegisterModuleType("transition_module", newTransitionModule)
+
+	_, errs := ctx.ParseBlueprintsFiles("Android.bp", nil)
+	assertNoErrors(t, errs)
+	_, errs = ctx.ResolveDependencies(nil)
+	assertOneErrorMatches(t, errs, `Can't get value of provider \*blueprint.providerTestMutatorInfo before mutator provider_mutator finished`)
 }
 
 type transitionTestMutator struct{}

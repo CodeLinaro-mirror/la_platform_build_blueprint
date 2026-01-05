@@ -558,7 +558,7 @@ func (d *baseModuleContext) GlobWithDeps(pattern string,
 	excludes []string) ([]string, error) {
 	result, err := d.context.glob(pattern, excludes)
 	if err == nil && d.context.incrementalEnabled {
-		hash, err := proptools.CalculateHash(result)
+		hash, err := proptools.CalculateHash(stringList(result))
 		if err != nil {
 			panic(newPanicErrorf(err, "failed to calculate hash for glob result: %s", d.ModuleName()))
 		}
@@ -590,10 +590,11 @@ func (d *baseModuleContext) storeCoreModuleInfo() {
 	// TODO (b/448182009): Add more properties if needed.
 	newLogicModule, newProperties := d.context.cloneLogicModule(d.module)
 	newModule := moduleInfo{
-		logicModule: newLogicModule,
-		properties:  newProperties,
-		directDeps:  slices.Clone(d.module.directDeps),
-		factory:     d.module.factory,
+		logicModule:       newLogicModule,
+		properties:        newProperties,
+		directDeps:        slices.Clone(d.module.directDeps),
+		factory:           d.module.factory,
+		relBlueprintsFile: d.module.relBlueprintsFile,
 	}
 	d.module.group.coreModuleInfo = newModule
 }
@@ -689,7 +690,7 @@ func (m *baseModuleContext) OtherModuleDependencyVariantExists(variations []Vari
 	if possibleDeps == nil {
 		return false
 	}
-	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, variations, false, false)
+	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, variations, false, false, m.module.startedMutator)
 	if errs != nil {
 		panic(errors.Join(errs...))
 	}
@@ -701,7 +702,7 @@ func (m *baseModuleContext) OtherModuleFarDependencyVariantExists(variations []V
 	if possibleDeps == nil {
 		return false
 	}
-	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, variations, true, false)
+	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, variations, true, false, m.module.startedMutator)
 	if errs != nil {
 		panic(errors.Join(errs...))
 	}
@@ -713,7 +714,7 @@ func (m *baseModuleContext) OtherModuleReverseDependencyVariantExists(name strin
 	if possibleDeps == nil {
 		return false
 	}
-	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, nil, false, true)
+	found, _, errs := m.context.findVariant(m.config, m.module, nil, possibleDeps, nil, false, true, m.module.startedMutator)
 	if errs != nil {
 		panic(errors.Join(errs...))
 	}
@@ -802,6 +803,11 @@ func (m *baseModuleContext) VisitDirectDepsProxy(visit func(proxy ModuleProxy)) 
 }
 
 func (m *baseModuleContext) WalkDeps(visit func(child, parent Module) bool) {
+	if m.module.startedGenerateBuildActions {
+		if _, ok := m.module.logicModule.(moduleUsesIncrementalWalkDeps); !ok {
+			panic(fmt.Errorf("WalkDeps called during GenerateBuildActions from a module not marked with ModuleUsesIncrementalWalkDeps"))
+		}
+	}
 	m.context.walkDeps(m.module, true, func(dep depInfo, parent *moduleInfo) bool {
 		m.visitingParent = parent
 		m.visitingDep = dep
@@ -816,6 +822,11 @@ func (m *baseModuleContext) WalkDeps(visit func(child, parent Module) bool) {
 }
 
 func (m *baseModuleContext) WalkDepsProxy(visit func(child, parent ModuleProxy) bool) {
+	if m.module.startedGenerateBuildActions {
+		if _, ok := m.module.logicModule.(moduleUsesIncrementalWalkDeps); !ok {
+			panic(fmt.Errorf("WalkDeps called during GenerateBuildActions from a module not marked with ModuleUsesIncrementalWalkDeps"))
+		}
+	}
 	m.context.walkDeps(m.module, true, func(dep depInfo, parent *moduleInfo) bool {
 		m.visitingParent = parent
 		m.visitingDep = dep
@@ -964,7 +975,6 @@ type mutatorContext struct {
 	replace          []replace
 	newVariations    moduleList    // new variants of existing modules
 	newModules       []*moduleInfo // brand new modules
-	onDemandDeps     []onDemandDep // dependencies created on demand.
 	defaultVariation *string
 	pauseFunc        pauseFunc
 }
@@ -1095,18 +1105,19 @@ func (mctx *mutatorContext) AddDependency(module Module, tag DependencyTag, deps
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
 		modInfo := module.info()
-		depInfo, errs := mctx.context.addVariationDependency(modInfo, mctx.mutator, mctx.config, nil, tag, dep, false)
+		di, errs := mctx.context.addVariationDependency(modInfo, mctx.mutator, mctx.config, nil, tag, dep, false)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
-		if !mctx.pause(depInfo) {
+		if !mctx.pause(di) {
 			// Pausing not supported by this mutator, new dependencies can't be returned.
-			depInfo = nil
+			di = nil
 		}
-		if depInfo != nil && depInfo.createdOnDemand {
-			mctx.onDemandDeps = append(mctx.onDemandDeps, onDemandDep{modInfo, depInfo, tag})
+		if di != nil && di.createdOnDemand {
+			modInfo.directDeps = append(modInfo.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
+			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, modInfo)
 		}
-		depInfos = append(depInfos, ModuleProxy{depInfo})
+		depInfos = append(depInfos, ModuleProxy{di})
 	}
 	return depInfos
 }
@@ -1145,7 +1156,7 @@ func (mctx *mutatorContext) AddReverseVariationDependency(variations []Variation
 		return
 	}
 
-	found, newVariant, errs := mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, false, true)
+	found, newVariant, errs := mctx.context.findVariant(mctx.config, mctx.module, tag, possibleDeps, variations, false, true, -1)
 	if errs != nil {
 		mctx.errs = append(mctx.errs, errs...)
 		return
@@ -1178,18 +1189,19 @@ func (mctx *mutatorContext) AddVariationDependencies(variations []Variation, tag
 
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
-		depInfo, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, false)
+		di, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, false)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
-		if !mctx.pause(depInfo) {
+		if !mctx.pause(di) {
 			// Pausing not supported by this mutator, new dependencies can't be returned.
-			depInfo = nil
+			di = nil
 		}
-		if depInfo != nil && depInfo.createdOnDemand {
-			mctx.onDemandDeps = append(mctx.onDemandDeps, onDemandDep{mctx.module, depInfo, tag})
+		if di != nil && di.createdOnDemand {
+			mctx.module.directDeps = append(mctx.module.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
+			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, mctx.module)
 		}
-		depInfos = append(depInfos, ModuleProxy{depInfo})
+		depInfos = append(depInfos, ModuleProxy{di})
 	}
 	return depInfos
 }
@@ -1199,18 +1211,19 @@ func (mctx *mutatorContext) AddFarVariationDependencies(variations []Variation, 
 
 	depInfos := make([]ModuleProxy, 0, len(deps))
 	for _, dep := range deps {
-		depInfo, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, true)
+		di, errs := mctx.context.addVariationDependency(mctx.module, mctx.mutator, mctx.config, variations, tag, dep, true)
 		if len(errs) > 0 {
 			mctx.errs = append(mctx.errs, errs...)
 		}
-		if !mctx.pause(depInfo) {
+		if !mctx.pause(di) {
 			// Pausing not supported by this mutator, new dependencies can't be returned.
-			depInfo = nil
+			di = nil
 		}
-		if depInfo != nil && depInfo.createdOnDemand {
-			mctx.onDemandDeps = append(mctx.onDemandDeps, onDemandDep{mctx.module, depInfo, tag})
+		if di != nil && di.createdOnDemand {
+			mctx.module.directDeps = append(mctx.module.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
+			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, mctx.module)
 		}
-		depInfos = append(depInfos, ModuleProxy{depInfo})
+		depInfos = append(depInfos, ModuleProxy{di})
 	}
 	return depInfos
 }

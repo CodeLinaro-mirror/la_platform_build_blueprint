@@ -288,6 +288,7 @@ type BinaryInfo struct {
 
 var BinaryProvider = blueprint.NewProvider[*BinaryInfo]()
 
+// @auto-generate: gob
 type DocsPackageInfo struct {
 	PkgPath string
 	Srcs    []string
@@ -782,6 +783,7 @@ func buildGoTest(ctx blueprint.ModuleContext, testRoot, testPkgArchive,
 
 var PrimaryBuilderProvider = blueprint.NewMutatorProvider[PrimaryBuilderInfo]("bootstrap_deps")
 
+// @auto-generate: gob
 type PrimaryBuilderInfo struct{}
 
 type singleton struct {
@@ -882,7 +884,6 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 			Rule:    blueprint.Phony,
 			Outputs: []string{"blueprint_tools"},
 			Inputs:  blueprintTools,
-			Default: true,
 		})
 	}
 
@@ -891,7 +892,6 @@ func (s *singleton) GenerateBuildActions(ctx blueprint.SingletonContext) {
 		Rule:    blueprint.Phony,
 		Outputs: []string{"blueprint_tests"},
 		Inputs:  blueprintTests,
-		Default: true,
 	})
 
 	// Add a phony target for running go tests
