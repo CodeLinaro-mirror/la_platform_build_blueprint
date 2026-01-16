@@ -72,26 +72,47 @@ type sandboxConfig interface {
 	ActionSandboxMetrics() *SandboxMetrics
 }
 
+type SandboxedAction struct {
+	Name      string
+	Sandboxed bool
+}
+
 // SandboxMetrics tracks the total number of rules and action sandboxing disabled
 // (i.e. opted-out) rules in action sandboxed builds
 type SandboxMetrics struct {
+	deduper       sync.Map
 	totalRules    int64
 	disabledRules int64
+	actions       []SandboxedAction
 }
 
-func (s *SandboxMetrics) updateSandboxMetrics(isSandboxDisabled bool) {
-	atomic.AddInt64(&s.totalRules, 1)
-	if isSandboxDisabled {
-		atomic.AddInt64(&s.disabledRules, 1)
+func (s *SandboxMetrics) updateSandboxMetrics(name string, source string, isSandboxDisabled bool) {
+	if source != "" {
+		if _, ok := s.deduper.LoadOrStore(source, true); ok {
+			return
+		}
+		name = source
 	}
+	s.totalRules += 1
+	if isSandboxDisabled {
+		s.disabledRules += 1
+	}
+	s.actions = append(s.actions, SandboxedAction{
+		Name:      name,
+		Sandboxed: !isSandboxDisabled,
+	})
 }
 
 func (s *SandboxMetrics) TotalRules() int64 {
-	return atomic.LoadInt64(&s.totalRules)
+	return s.totalRules
 }
 
 func (s *SandboxMetrics) DisabledRules() int64 {
-	return atomic.LoadInt64(&s.disabledRules)
+	return s.disabledRules
+}
+
+func (s *SandboxMetrics) Actions() []SandboxedAction {
+	return s.actions
 }
 
 // A Context contains all the state needed to parse a set of Blueprints files
@@ -214,7 +235,7 @@ type Context struct {
 
 	incrementalProviderTest bool
 
-	buildActionsCache       *BuildActionCache
+	keyValueStoreCache      *KeyValueStoreCache
 	buildActionsToCacheLock sync.Mutex
 	orderOnlyStringsCache   OrderOnlyStringsCache
 	orderOnlyStrings        syncmap.SyncMap[uniquelist.UniqueList[string], *orderOnlyStringsInfo]
@@ -393,6 +414,9 @@ func (group *moduleGroup) moduleByVariantName(name string) *moduleInfo {
 
 // registerSupportedVariants registers the supported variants, but does not create them
 func (group *moduleGroup) registerSupportedVariants(mutatorName string, infos TransitionInfos) {
+	if len(infos) == 0 {
+		return
+	}
 	group.variantOnDemandLock.Lock()
 	defer group.variantOnDemandLock.Unlock()
 	if group.supportedVariantsOnDemand == nil {
@@ -404,39 +428,23 @@ func (group *moduleGroup) registerSupportedVariants(mutatorName string, infos Tr
 	group.supportedVariantsOnDemand[mutatorName] = append(group.supportedVariantsOnDemand[mutatorName], infos...)
 }
 
-func (group *moduleGroup) supportsOnDemandVariant(onDemandVariants variationMap, far bool, atMutatorIndex int, transitionMutators []*transitionMutatorImpl) bool {
-	for mutator, variant := range onDemandVariants.variations {
-		if supportedOnDemandVariants, exists := group.supportedVariantsOnDemand[mutator]; exists {
-			found := false
-			for _, supportedOnDemandVariant := range supportedOnDemandVariants {
-				if supportedOnDemandVariant.Variation() == variant {
-					found = true
-				}
-			}
-			if !found {
-				return false
-			}
-		} else {
-			return false
+// searchOnDemandVariant returns true if an on-demand variant creation should be attempted.
+// It uses the following heuristics.
+// 1. SplitOnDemand is non-nil for any mutator in the requested variation map.
+// 2. No transition has occurred yet
+//
+// Feasibility of on-demand variant request will be determined subsequently by using `applyTransitions`
+// across a sliding window on the on-demand variant.
+func (group *moduleGroup) searchOnDemandVariant(onDemandVariants variationMap, far bool, atMutatorIndex int, transitionMutators []*transitionMutatorImpl) bool {
+	for mutator, _ := range onDemandVariants.variations {
+		if _, exists := group.supportedVariantsOnDemand[mutator]; exists {
+			return true
 		}
 	}
-	transitionMutatorNameToIndex := map[string]int{}
-	for _, t := range transitionMutators {
-		transitionMutatorNameToIndex[t.name] = t.mutatorIndex
+	if len(transitionMutators) > 0 && atMutatorIndex < transitionMutators[0].mutatorIndex {
+		return true
 	}
-	if !far {
-		// non-far uses strict equality.
-		// check that the mutator keys of requested variant and supported variants of the group match.
-		for mutator := range group.supportedVariantsOnDemand {
-			if index, _ := transitionMutatorNameToIndex[mutator]; atMutatorIndex < index {
-				continue // Non-far, but the transition has not occurred yet.
-			}
-			if _, exists := onDemandVariants.variations[mutator]; !exists {
-				return false
-			}
-		}
-	}
-	return true
+	return false
 }
 
 // createVariantOnDemand uses group.coreModuleInfo.factory() to create an "empty" variant on demand.
@@ -468,12 +476,24 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 			// Transitive variant on demand.
 			// Set `requestedOnDemandVariant` on this transitive dep.
 			// This will be used in the main coordinator goroutine to create the correct transition for this variant.
-			dep.requestedOnDemandVariant = newmodule.requestedOnDemandVariant
+			for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
+				if transitionMutator.mutatorIndex > newmodule.finishedMutator {
+					// Copy requestedOnDemandVariant from rdep to dep on-demand modules.
+					// This will be done only for the transition mutators that have not yet
+					// been completed in rerunMutator.
+					// variation map for earlier transition mutators will be resolved by `findVariant`.
+					//
+					// TODO (spandandas): Does this handle transition mutators between
+					// newmodule.finishedMutator and c.completedTransitionMutators?
+					dep.requestedOnDemandVariant.set(transitionMutator.name, newmodule.requestedOnDemandVariant.get(transitionMutator.name))
+				}
+			}
 		}
 		if p != nil {
 			p(dep)
 		}
 	}
+
 	// initialize the properties from coreModuleInfo.
 	if fromMutatorIndex == c.mutatorIndexAfterLastCreateModule {
 		newlogicmodule, newproperties := c.cloneLogicModule(&newmodule.group.coreModuleInfo)
@@ -486,6 +506,7 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 		if index < fromMutatorIndex {
 			continue
 		}
+		newmodule.startedMutator = index
 		mctx := &mutatorContext{
 			baseModuleContext: baseModuleContext{
 				context: c,
@@ -501,6 +522,7 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 			mctx.mutator = mi
 			mi.bottomUpMutator(mctx)
 		}
+		newmodule.finishedMutator = index
 		if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 {
 			panic("TODO (b/448182009): Add support for AddReverseDependency, ReplaceDependency, Rename")
 		}
@@ -508,6 +530,11 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 		// The module has been mutated till the current mutator.
 		// Do not mutate further.
 		if index == tillMutatorIndex {
+			break
+		}
+
+		// Err
+		if newmodule.createdOnDemandIncompatible {
 			break
 		}
 	}
@@ -594,6 +621,9 @@ type moduleInfo struct {
 	createdOnDemand            bool
 	createdOnDemandReplaceWith *moduleInfo
 	requestedOnDemandVariant   variationMap
+	// Properties used to determine whether a requested on-demand variant can be created.
+	createdOnDemandIncompatible    bool
+	createdOnDemandSupportedSplits []TransitionInfo
 }
 
 type providerInfo struct {
@@ -628,7 +658,7 @@ type commonIncrementalInfo struct {
 	// restored.
 	hasUnrestoredProvider []bool
 	providerRestoreLock   sync.Mutex
-	buildActionCacheKey   *BuildActionCacheKey
+	buildActionCacheKey   *DataCacheKey
 	globCache             []globResultCache
 	providerInfo
 }
@@ -995,7 +1025,7 @@ func (c *Context) CacheAllBuildActions(soongOutDir string) (err error) {
 		return err
 	}
 	defer func() {
-		err = errors.Join(err, c.buildActionsCache.close())
+		err = errors.Join(err, c.keyValueStoreCache.close())
 	}()
 	err = c.EncContext.EncodeReferences()
 	return err
@@ -2250,9 +2280,8 @@ func blueprintDepsMutator(ctx BottomUpMutatorContext) {
 // for onDemand: true, a copy of the dependency will be created on demand and used as the context
 // for IncomingTransition.
 func (c *Context) applyTransitions(config any, module *moduleInfo, depTag DependencyTag, group *moduleGroup, variant variationMap,
-	requestedVariations []Variation, far bool, onDemand bool) (variationMap, []error) {
+	requestedVariations []Variation, far bool, onDemandMatchingVariant *moduleInfo) (variationMap, []error) {
 	// Initialize some variables that will be used to manage IncomingTransition context of on demand variants.
-	var onDemandMatchingVariant *moduleInfo
 	onDemandFromMutatorIndex := c.mutatorIndexAfterLastCreateModule
 
 	for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
@@ -2297,15 +2326,15 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 			}
 		}
 
-		if onDemand {
+		if onDemandMatchingVariant != nil {
 			// Mutate the onDemand variant through a moving window,
 			// from the previous transition mutator to the current transition mutator.
 			// This variant can then be used as the context for the IncomingTransition.
-			if onDemandFromMutatorIndex == 0 {
-				onDemandMatchingVariant = c.createVariantOnDemand(group, variant) // initialize
-			}
-			c.rerunMutatorsOnVariantOnDemand(onDemandMatchingVariant, onDemandFromMutatorIndex, transitionMutator.mutatorIndex, nil, config)
 			matchingInputVariant = onDemandMatchingVariant
+			if outgoingTransitionInfo != nil {
+				onDemandMatchingVariant.requestedOnDemandVariant.variations[transitionMutator.name] = outgoingTransitionInfo.Variation()
+			}
+			c.rerunMutatorsOnVariantOnDemand(onDemandMatchingVariant, onDemandFromMutatorIndex, transitionMutator.mutatorIndex, nil, config) // Mutate till the current mutator.
 			onDemandFromMutatorIndex = transitionMutator.mutatorIndex + 1
 		}
 
@@ -2329,6 +2358,23 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 				variation = finalTransitionInfo.Variation()
 			}
 			variant.set(transitionMutator.name, variation)
+			// For on-demand variants, check if requested variation can be supported by `SplitOnDemand`.
+			if onDemandMatchingVariant != nil && variation == "" {
+				onDemandMatchingVariant.requestedOnDemandVariant.delete(transitionMutator.name)
+			} else if onDemandMatchingVariant != nil {
+				found := false
+				for _, split := range onDemandMatchingVariant.createdOnDemandSupportedSplits {
+					if split.Variation() == variation {
+						found = true
+					}
+				}
+				if !found {
+					onDemandMatchingVariant.createdOnDemandIncompatible = true
+					return variant, nil
+				}
+				onDemandMatchingVariant.requestedOnDemandVariant.variations[transitionMutator.name] = variation
+				onDemandMatchingVariant.createdOnDemandSupportedSplits = nil // reset for next transition mutator check.
+			}
 		}
 
 		if (matchingInputVariant == nil && !explicitlyRequested) || variant.get(transitionMutator.name) == "" {
@@ -2365,7 +2411,7 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 
 	if !reverse {
 		var errs []error
-		newVariant, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, false)
+		newVariant, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, nil)
 		if len(errs) > 0 {
 			return nil, variationMap{}, errs
 		}
@@ -2403,15 +2449,14 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 
 	if foundDep == nil &&
 		!c.allowMissingDependencies && // TODO (b/448182009): Skip checking for possible on-demand variant if allowMissingDependencies is set.
-		possibleDeps.supportsOnDemandVariant(newVariantBeforeTransitions, far, mutatorIndex, c.transitionMutators) {
-		newVariantOnDemand, errs := c.applyTransitions(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far, true)
-		if len(errs) > 0 {
-			return nil, variationMap{}, errs
+		possibleDeps.searchOnDemandVariant(newVariantBeforeTransitions, far, mutatorIndex, c.transitionMutators) {
+		onDemandVariantForIncomingTransition := c.createVariantOnDemand(possibleDeps, newVariantBeforeTransitions)
+		newVariantOnDemand, errs := c.applyTransitions(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far, onDemandVariantForIncomingTransition)
+		if len(errs) > 0 || onDemandVariantForIncomingTransition.createdOnDemandIncompatible {
+			return nil, newVariantOnDemand, errs
 		}
-		if possibleDeps.supportsOnDemandVariant(newVariantOnDemand, far, mutatorIndex, c.transitionMutators) {
-			foundDep = c.createVariantOnDemand(possibleDeps, newVariantOnDemand)
-			newVariant = newVariantOnDemand
-		}
+		foundDep = c.createVariantOnDemand(possibleDeps, onDemandVariantForIncomingTransition.requestedOnDemandVariant.clone())
+		newVariant = onDemandVariantForIncomingTransition.requestedOnDemandVariant.clone()
 	}
 
 	return foundDep, newVariant, nil
@@ -3183,20 +3228,20 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 		// TODO(b/356414070): Revisit this logic once we have a clearer picture about
 		// how the incremental build pieces fit together.
 		if c.GetIncrementalEnabled() {
-			if c.buildActionsCache == nil {
-				c.buildActionsCache = &BuildActionCache{}
+			if c.keyValueStoreCache == nil {
+				c.keyValueStoreCache = &KeyValueStoreCache{}
 				dbPath := filepath.Join(c.SrcDir(), c.IncrementalDBDir())
 				// Remove gob files and all the cached data from the key-value store for a full build.
 				if !c.GetIncrementalAnalysis() {
-					err := errors.Join(c.buildActionsCache.reset(c, dbPath), c.fs.Remove(filepath.Join(dbPath, OrderOnlyStringsCacheFile)))
+					err := errors.Join(c.keyValueStoreCache.reset(c, dbPath), c.fs.Remove(filepath.Join(dbPath, OrderOnlyStringsCacheFile)))
 					if err != nil {
 						panic(fmt.Errorf("error resetting incremental db: %w", err))
 					}
 				}
-				if err := c.buildActionsCache.open(dbPath); err != nil {
+				if err := c.keyValueStoreCache.open(dbPath); err != nil {
 					panic(fmt.Errorf("error opening incremental db: %w", err))
 				}
-				c.EncContext = gobtools.NewEncContext(c.buildActionsCache.referencesDb)
+				c.EncContext = gobtools.NewEncContext(c.keyValueStoreCache.referencesDb)
 			}
 
 			for _, p := range packageContexts {
@@ -3662,6 +3707,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.createdOnDemandReplaceWith = nil
 		module.newDirectDeps = nil
 		module.newOnDemandReverseDeps = nil
+		module.createdOnDemandSupportedSplits = nil
 	}
 
 	return deps, errs
@@ -3920,7 +3966,7 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 				if p == nil {
 					continue
 				}
-				err := c.buildActionsCache.writeProvider(c.EncContext, info.providerInitialValueHashes[i], CachedProvider{
+				err := c.keyValueStoreCache.writeProvider(c.EncContext, info.providerInitialValueHashes[i], CachedProvider{
 					Id:    providerRegistry[i],
 					Value: p,
 				})
@@ -3934,7 +3980,7 @@ func (c *Context) generateOneSingletonBuildActions(config interface{},
 					})
 			}
 
-			if err := c.buildActionsCache.writeSingletonBuildAction(c.EncContext, info.buildActionCacheKey,
+			if err := c.keyValueStoreCache.writeSingletonBuildAction(c.EncContext, info.buildActionCacheKey,
 				&SingletonActionCachedData{
 					ProviderHashes:           providerHashes,
 					DependencyProviderHashes: cache,
@@ -3967,7 +4013,7 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 		return
 	}
 
-	info.buildActionCacheKey = &BuildActionCacheKey{
+	info.buildActionCacheKey = &DataCacheKey{
 		Id: info.name,
 	}
 
@@ -3977,7 +4023,7 @@ func (c *Context) restoreSingleton(info *singletonInfo) {
 		return
 	}
 
-	data, err := c.buildActionsCache.readSingletonBuildAction(c.EncContext, info.buildActionCacheKey)
+	data, err := c.keyValueStoreCache.readSingletonBuildAction(c.EncContext, info.buildActionCacheKey)
 	if err != nil {
 		panic(err)
 	}
@@ -5375,7 +5421,7 @@ func (c *Context) writeAllModuleActions(nw *ninjaWriter, shardNinja bool, ninjaF
 				parallelVisitSimple(slices.Values(modules), parallelVisitLimit,
 					func(m *moduleInfo, _ int) []error {
 						if !m.incrementalRestored {
-							m.cacheModuleBuildActions(c.EncContext, c.buildActionsCache)
+							m.cacheModuleBuildActions(c.EncContext, c.keyValueStoreCache)
 						}
 						return nil
 					})
@@ -5466,7 +5512,7 @@ func (c *Context) writeIncrementalModules(modules []*moduleInfo, baseWriter *nin
 
 		if m.incrementalRestored && !c.incrementalProviderTest {
 			// Read from the cache if the module is restored.
-			moduleBytes, err = c.buildActionsCache.readNinjaStatements(m.buildActionCacheKey)
+			moduleBytes, err = c.keyValueStoreCache.readNinjaStatements(m.buildActionCacheKey)
 		} else {
 			// Generate statements for dirty modules.
 			inMemoryWriter := bufferPool.Get().(*bytes.Buffer)
@@ -5484,7 +5530,7 @@ func (c *Context) writeIncrementalModules(modules []*moduleInfo, baseWriter *nin
 				moduleBytes = slices.Clone(inMemoryWriter.Bytes())
 				// Write the newly generated statements back to the cache for incremental module.
 				if m.buildActionCacheKey != nil {
-					err = c.buildActionsCache.writeNinjaStatements(m.buildActionCacheKey, moduleBytes)
+					err = c.keyValueStoreCache.writeNinjaStatements(m.buildActionCacheKey, moduleBytes)
 				}
 			}
 		}
@@ -5581,7 +5627,7 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 	for _, info := range c.singletonInfo {
 		if info.incrementalRestored && !c.incrementalProviderTest {
 			// Read from the cache if the singleton is restored.
-			ninjaBytes, err = c.buildActionsCache.readNinjaStatements(info.buildActionCacheKey)
+			ninjaBytes, err = c.keyValueStoreCache.readNinjaStatements(info.buildActionCacheKey)
 			if err != nil {
 				return err
 			}
@@ -5631,7 +5677,7 @@ func (c *Context) writeAllSingletonActions(nw *ninjaWriter) error {
 			ninjaBytes = inMemoryWriter.Bytes()
 
 			if info.incrementalSupported {
-				c.buildActionsCache.writeNinjaStatements(info.buildActionCacheKey, ninjaBytes)
+				c.keyValueStoreCache.writeNinjaStatements(info.buildActionCacheKey, ninjaBytes)
 			}
 		}
 		nw.writer.Write(ninjaBytes)
@@ -6152,6 +6198,40 @@ func (c *Context) getModule(moduleName string, variant []Variation) *moduleInfo 
 		}
 	}
 	return nil
+}
+
+// RecordSandboxMetrics visits all the rules and records their sandboxing state in the metrics.
+func (c *Context) RecordSandboxMetrics(config any) {
+	sbConfig := config.(sandboxConfig)
+	metrics := sbConfig.ActionSandboxMetrics()
+
+	if !sbConfig.IsActionSandboxedBuild() || metrics == nil {
+		return
+	}
+	// We would get incorrect results if we recorded these metrics on an incremental analysis,
+	// as we wouldn't process all rules
+	if c.GetIncrementalAnalysis() {
+		return
+	}
+
+	for rule, def := range c.globalRules {
+		name := c.nameTracker.Rule(rule)
+		metrics.updateSandboxMetrics(name, def.Source, def.SandboxDisabled)
+	}
+
+	for module := range c.iterateAllVariants() {
+		for _, r := range module.actionDefs.rules {
+			name := r.fullName(nil)
+			metrics.updateSandboxMetrics(name, r.def_.Source, r.def_.SandboxDisabled)
+		}
+	}
+
+	for _, info := range c.singletonInfo {
+		for _, r := range info.actionDefs.rules {
+			name := r.fullName(nil)
+			metrics.updateSandboxMetrics(name, r.def_.Source, r.def_.SandboxDisabled)
+		}
+	}
 }
 
 var fileHeaderTemplate = template.Must(template.New("fileHeader").Parse(
