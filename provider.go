@@ -285,7 +285,7 @@ func maybeRestoreProviders(c *Context, m *commonIncrementalInfo, provider *provi
 			m.providerRestoreLock.Lock()
 			defer m.providerRestoreLock.Unlock()
 			if m.hasUnrestoredProvider[provider.id] {
-				p, err := c.buildActionsCache.readProvider(c.EncContext, m.providerInitialValueHashes[provider.id], provider)
+				p, err := c.keyValueStoreCache.readProvider(c.EncContext, m.providerInitialValueHashes[provider.id], provider)
 				if err != nil {
 					panic(err)
 				}
@@ -329,6 +329,9 @@ func validateSingletonProvider(s *singletonInfo, provider *providerKey) {
 }
 
 func (c *Context) mutatorFinishedForModule(mutator *mutatorInfo, m *moduleInfo) bool {
+	if m.createdOnDemand {
+		return m.finishedMutator >= mutator.index
+	}
 	if c.finishedMutators[mutator.index] {
 		// mutator pass finished for all modules
 		return true
