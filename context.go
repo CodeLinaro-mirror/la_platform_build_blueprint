@@ -172,6 +172,7 @@ type Context struct {
 	globLock sync.Mutex
 
 	restoredGlobsFromCache map[globKey]pathtools.GlobResult
+	restoredGlobMetrics    pathtools.RestoredGlobsMetrics
 
 	srcDir           string
 	incrementalDBDir string
@@ -528,9 +529,9 @@ type moduleInfo struct {
 	properties  []interface{}
 
 	// set during ResolveDependencies
-	missingDeps    []string
-	newDirectDeps  []*moduleInfo
-	newReverseDeps []*moduleInfo
+	missingDeps            []string
+	newDirectDeps          []*moduleInfo
+	newOnDemandReverseDeps []reverseDep
 
 	// set during updateDependencies
 	reverseDeps []*moduleInfo
@@ -3192,9 +3193,10 @@ func (c *Context) PrepareBuildActions(config interface{}) (deps []string, errs [
 			if c.buildActionsCache == nil {
 				c.buildActionsCache = &BuildActionCache{}
 				dbPath := filepath.Join(c.SrcDir(), c.IncrementalDBDir())
-				// Remove all the cached data from the key-value store for a full build.
+				// Remove gob files and all the cached data from the key-value store for a full build.
 				if !c.GetIncrementalAnalysis() {
-					if err := c.buildActionsCache.reset(c, dbPath); err != nil {
+					err := errors.Join(c.buildActionsCache.reset(c, dbPath), c.fs.Remove(filepath.Join(dbPath, OrderOnlyStringsCacheFile)))
+					if err != nil {
 						panic(fmt.Errorf("error resetting incremental db: %w", err))
 					}
 				}
@@ -3394,12 +3396,13 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	direction mutatorDirection) (deps []string, errs []error) {
 
 	type globalStateChange struct {
-		reverse         []reverseDep
-		rename          []rename
-		replace         []replace
-		newModules      []*moduleInfo
-		onDemandModules []*moduleInfo
-		deps            []string
+		reverse             []reverseDep
+		rename              []rename
+		replace             []replace
+		newModules          []*moduleInfo
+		onDemandModules     []*moduleInfo
+		onDemandReverseDeps []reverseDep
+		deps                []string
 	}
 
 	type createdOnDemandStateChange struct {
@@ -3408,6 +3411,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	}
 
 	reverseDeps := make(map[*moduleInfo][]depInfo)
+	onDemandReverseDeps := make(map[*moduleInfo][]depInfo)
 	var rename []rename
 	var replace []replace
 	var newModules []*moduleInfo
@@ -3438,7 +3442,8 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			if module == moduleReplaceWith {
 				c.rerunMutatorsOnVariantOnDemand(module, c.mutatorIndexAfterLastCreateModule, mutatorGroup[len(mutatorGroup)-1].index, pause, config) // Mutate till the current mutator.
 				globalStateCh <- globalStateChange{
-					onDemandModules: []*moduleInfo{module},
+					onDemandModules:     []*moduleInfo{module},
+					onDemandReverseDeps: module.newOnDemandReverseDeps,
 				}
 			}
 			module.createdOnDemandReplaceWith = moduleReplaceWith
@@ -3480,13 +3485,14 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			errsCh <- mctx.errs
 			hasErrors = true
 		} else {
-			if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 {
+			if len(mctx.reverseDeps) > 0 || len(mctx.replace) > 0 || len(mctx.rename) > 0 || len(mctx.newModules) > 0 || len(mctx.ninjaFileDeps) > 0 || len(mctx.module.newOnDemandReverseDeps) > 0 {
 				globalStateCh <- globalStateChange{
-					reverse:    mctx.reverseDeps,
-					replace:    mctx.replace,
-					rename:     mctx.rename,
-					newModules: mctx.newModules,
-					deps:       mctx.ninjaFileDeps,
+					reverse:             mctx.reverseDeps,
+					replace:             mctx.replace,
+					rename:              mctx.rename,
+					newModules:          mctx.newModules,
+					deps:                mctx.ninjaFileDeps,
+					onDemandReverseDeps: module.newOnDemandReverseDeps,
 				}
 			}
 		}
@@ -3518,6 +3524,9 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 			case globalStateChange := <-globalStateCh:
 				for _, r := range globalStateChange.reverse {
 					reverseDeps[r.module] = append(reverseDeps[r.module], r.dep)
+				}
+				for _, r := range globalStateChange.onDemandReverseDeps {
+					onDemandReverseDeps[r.module] = append(onDemandReverseDeps[r.module], r.dep)
 				}
 				replace = append(replace, globalStateChange.replace...)
 				rename = append(rename, globalStateChange.rename...)
@@ -3613,6 +3622,17 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}
 
+	// Set forward/reverseDeps of on-demand variants.
+	// Sort the deps to ensure deterministic orderding.
+	for module, deps := range onDemandReverseDeps {
+		sort.Sort(depSorter{deps, c.nameInterface})
+		for _, dep := range deps {
+			module.forwardDeps = append(module.forwardDeps, dep.module)
+			dep.module.reverseDeps = append(dep.module.reverseDeps, module)
+		}
+		module.newOnDemandReverseDeps = nil
+	}
+
 	for _, module := range newModules {
 		errs = c.addModule(module)
 		if len(errs) > 0 {
@@ -3638,11 +3658,6 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	}
 
 	for _, module := range onDemandModules {
-		// Set forward and reverse deps for correct traversal order in future mutators.
-		for _, rdep := range module.newReverseDeps {
-			rdep.forwardDeps = append(rdep.forwardDeps, module)
-			module.reverseDeps = append(module.reverseDeps, rdep)
-		}
 		for _, fd := range module.newDirectDeps {
 			fd.reverseDeps = append(fd.reverseDeps, module)
 		}
@@ -3653,7 +3668,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.createdOnDemand = false
 		module.createdOnDemandReplaceWith = nil
 		module.newDirectDeps = nil
-		module.newReverseDeps = nil
+		module.newOnDemandReverseDeps = nil
 	}
 
 	return deps, errs
@@ -5673,6 +5688,10 @@ func (c *Context) SetBeforePrepareBuildActionsHook(hookFn func() error) {
 	c.BeforePrepareBuildActionsHook = hookFn
 }
 
+func (c *Context) RestoredGlobMetrics() pathtools.RestoredGlobsMetrics {
+	return c.restoredGlobMetrics
+}
+
 // keyForPhonyCandidate gives a unique identifier for a set of deps.
 func keyForPhonyCandidate(stringDeps []string) uint64 {
 	hasher := fnv.New64a()
@@ -5699,7 +5718,9 @@ func (c *Context) deduplicateOrderOnlyDeps(modules []*moduleInfo) *localBuildAct
 	defer c.EndEvent("deduplicate_order_only_deps")
 
 	var phonys []*buildDef
-	c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
+	if c.orderOnlyStringsCache == nil {
+		c.orderOnlyStringsCache = make(OrderOnlyStringsCache)
+	}
 	c.orderOnlyStrings.Range(func(key uniquelist.UniqueList[string], info *orderOnlyStringsInfo) bool {
 		if info.dedup {
 			dedup := fmt.Sprintf("dedup-%x", keyForPhonyCandidate(key.ToSlice()))

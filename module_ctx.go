@@ -889,17 +889,18 @@ func (m *moduleContext) Rule(pctx PackageContext, name string,
 
 	m.scope.ReparentTo(pctx)
 
-	config, ok := m.baseModuleContext.Config().(sandboxConfig)
-	if ok && !config.IsActionSandboxedBuild() {
+	config := m.baseModuleContext.Config()
+	sbConfig, ok := config.(sandboxConfig)
+	if ok && !sbConfig.IsActionSandboxedBuild() {
 		// sandbox_disabled variable should be written to the ninja file only when
 		// action sandboxing is enabled, to account for the executors that do not
 		// support this variable and to decrease the ninja file size.
 		params.SandboxDisabled = false
-	} else if ok && config.IsActionSandboxedBuild() && config.ActionSandboxMetrics() != nil {
-		config.ActionSandboxMetrics().updateSandboxMetrics(params.SandboxDisabled)
+	} else if ok && sbConfig.IsActionSandboxedBuild() && sbConfig.ActionSandboxMetrics() != nil {
+		sbConfig.ActionSandboxMetrics().updateSandboxMetrics(params.SandboxDisabled)
 	}
 
-	r, err := m.scope.AddLocalRule(name, &params, argNames...)
+	r, err := m.scope.AddLocalRule(config, name, &params, argNames...)
 	if err != nil {
 		panic(err)
 	}
@@ -1115,7 +1116,13 @@ func (mctx *mutatorContext) AddDependency(module Module, tag DependencyTag, deps
 		}
 		if di != nil && di.createdOnDemand {
 			modInfo.directDeps = append(modInfo.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
-			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, modInfo)
+			modInfo.newOnDemandReverseDeps = append(modInfo.newOnDemandReverseDeps, reverseDep{
+				module: modInfo,
+				dep: depInfo{
+					di.createdOnDemandReplaceWith,
+					tag,
+				},
+			})
 		}
 		depInfos = append(depInfos, ModuleProxy{di})
 	}
@@ -1199,7 +1206,13 @@ func (mctx *mutatorContext) AddVariationDependencies(variations []Variation, tag
 		}
 		if di != nil && di.createdOnDemand {
 			mctx.module.directDeps = append(mctx.module.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
-			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, mctx.module)
+			mctx.module.newOnDemandReverseDeps = append(mctx.module.newOnDemandReverseDeps, reverseDep{
+				module: mctx.module,
+				dep: depInfo{
+					di.createdOnDemandReplaceWith,
+					tag,
+				},
+			})
 		}
 		depInfos = append(depInfos, ModuleProxy{di})
 	}
@@ -1221,7 +1234,13 @@ func (mctx *mutatorContext) AddFarVariationDependencies(variations []Variation, 
 		}
 		if di != nil && di.createdOnDemand {
 			mctx.module.directDeps = append(mctx.module.directDeps, depInfo{di.createdOnDemandReplaceWith, tag})
-			di.createdOnDemandReplaceWith.newReverseDeps = append(di.createdOnDemandReplaceWith.newReverseDeps, mctx.module)
+			mctx.module.newOnDemandReverseDeps = append(mctx.module.newOnDemandReverseDeps, reverseDep{
+				module: mctx.module,
+				dep: depInfo{
+					di.createdOnDemandReplaceWith,
+					tag,
+				},
+			})
 		}
 		depInfos = append(depInfos, ModuleProxy{di})
 	}
