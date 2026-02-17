@@ -432,6 +432,9 @@ type BaseModuleContext interface {
 	RegisterConfigurableEvaluator(evaluator proptools.ConfigurableEvaluator)
 
 	base() *baseModuleContext
+
+	// Returns true if the module should be saved in the context object used by Android tests.
+	CaptureModuleForTests() bool
 }
 
 type DynamicDependerModuleContext BottomUpMutatorContext
@@ -595,6 +598,7 @@ func (d *baseModuleContext) storeCoreModuleInfo() {
 		directDeps:        slices.Clone(d.module.directDeps),
 		factory:           d.module.factory,
 		relBlueprintsFile: d.module.relBlueprintsFile,
+		pos:               d.module.pos,
 	}
 	d.module.group.coreModuleInfo = newModule
 }
@@ -890,16 +894,6 @@ func (m *moduleContext) Rule(pctx PackageContext, name string,
 	m.scope.ReparentTo(pctx)
 
 	config := m.baseModuleContext.Config()
-	sbConfig, ok := config.(sandboxConfig)
-	if ok && !sbConfig.IsActionSandboxedBuild() {
-		// sandbox_disabled variable should be written to the ninja file only when
-		// action sandboxing is enabled, to account for the executors that do not
-		// support this variable and to decrease the ninja file size.
-		params.SandboxDisabled = false
-	} else if ok && sbConfig.IsActionSandboxedBuild() && sbConfig.ActionSandboxMetrics() != nil {
-		sbConfig.ActionSandboxMetrics().updateSandboxMetrics(params.SandboxDisabled)
-	}
-
 	r, err := m.scope.AddLocalRule(config, name, &params, argNames...)
 	if err != nil {
 		panic(err)
@@ -962,6 +956,14 @@ func (m *baseModuleContext) EarlyGetMissingDependencies() []string {
 
 func (m *baseModuleContext) RegisterConfigurableEvaluator(evaluator proptools.ConfigurableEvaluator) {
 	m.evaluator = evaluator
+}
+
+// Do not capture on-demand variants when the mutators are being
+// run on the variant till the mutator at which it was requested.
+// This ensures that there are no dups.
+// The final stage of GenerateBuildActions will add it to the context.
+func (m *baseModuleContext) CaptureModuleForTests() bool {
+	return !m.module.createdOnDemand
 }
 
 //

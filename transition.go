@@ -246,8 +246,17 @@ func (t *transitionMutatorImpl) addRequiredVariation(m *moduleInfo, variation st
 func (t *transitionMutatorImpl) propagateMutator(mctx BaseModuleContext) {
 	module := mctx.(*mutatorContext).module
 	mutatorSplits := t.mutator.Split(mctx)
+	if mctx.base().context.GetSplitAllVariants() {
+		// If splitAllVariants=true, frontload the creation of all supported variants.
+		mutatorSplits = append(mutatorSplits, t.mutator.SplitOnDemand(mctx)...)
+	}
 	if mutatorSplits == nil || len(mutatorSplits) == 0 {
 		panic(fmt.Errorf("transition mutator %s returned no splits for module %s", t.name, mctx.ModuleName()))
+	}
+	if module.createdOnDemand {
+		allSplits := append(mutatorSplits, t.mutator.SplitOnDemand(mctx)...)
+		module.createdOnDemandSupportedSplits = append(module.createdOnDemandSupportedSplits, allSplits...)
+		return
 	}
 
 	// transitionVariations for given a module can be mutated by the module itself
@@ -289,7 +298,9 @@ func (t *transitionMutatorImpl) propagateMutator(mctx BaseModuleContext) {
 	module.outgoingTransitionCache = outgoingTransitionVariationCache
 	module.splitTransitionVariations = transitionVariations
 	module.splitTransitionInfos = transitionInfos
-	module.group.registerSupportedVariants(t.name, t.mutator.SplitOnDemand(mctx))
+	if !mctx.base().context.GetSplitAllVariants() {
+		module.group.registerSupportedVariants(t.name, t.mutator.SplitOnDemand(mctx))
+	}
 }
 
 var (
@@ -427,6 +438,10 @@ func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 	mc.module.currentTransitionMutator = ""
 
 	if len(variations) < 1 {
+		if mc.module.createdOnDemand {
+			mc.module.createdOnDemandIncompatible = true
+			return
+		}
 		panic(fmt.Errorf("no variations found for module %s by mutator %s",
 			mctx.ModuleName(), t.name))
 	}
@@ -477,7 +492,7 @@ func (c *Context) RegisterTransitionMutator(name string, mutator TransitionMutat
 	c.RegisterBottomUpMutator(name+"_mutate", impl.mutateMutator)
 
 	impl.index = len(c.transitionMutators)
-	impl.mutatorIndex = len(c.mutatorInfo)
+	impl.mutatorIndex = len(c.mutatorInfo) - 1
 	c.transitionMutators = append(c.transitionMutators, impl)
 	c.transitionMutatorNames = append(c.transitionMutatorNames, name)
 
