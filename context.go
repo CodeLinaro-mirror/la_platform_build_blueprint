@@ -481,7 +481,8 @@ func (c *Context) rerunMutatorsOnVariantOnDemand(newmodule *moduleInfo, fromMuta
 			// Set `requestedOnDemandVariant` on this transitive dep.
 			// This will be used in the main coordinator goroutine to create the correct transition for this variant.
 			for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
-				if transitionMutator.mutatorIndex > newmodule.finishedMutator {
+				if transitionMutator.mutatorIndex >
+					newmodule.finishedMutator+1 { // The +1 is to account for Mutate function of transition, which can create additional deps.
 					// Copy requestedOnDemandVariant from rdep to dep on-demand modules.
 					// This will be done only for the transition mutators that have not yet
 					// been completed in rerunMutator.
@@ -2510,6 +2511,11 @@ func (c *Context) addVariationDependency(module *moduleInfo, mutator *mutatorInf
 			Pos: module.pos,
 		}}
 	}
+	if foundDep.createdOnDemand {
+		// `runMutator` will create the dependency edges, deduping on demand variants if necessary.
+		// Also, defer the beforeInModuleList check to the end of runMutator.
+		return foundDep, nil
+	}
 	// AddVariationDependency allows adding a dependency on itself, but only if
 	// that module is earlier in the module list than this one, since we always
 	// run GenerateBuildActions in order for the variants of a module
@@ -2518,10 +2524,6 @@ func (c *Context) addVariationDependency(module *moduleInfo, mutator *mutatorInf
 			Err: fmt.Errorf("%q depends on later version of itself", depName),
 			Pos: module.pos,
 		}}
-	}
-	if foundDep.createdOnDemand {
-		// `runMutator` will create the dependency edges, deduping on demand variants if necessary.
-		return foundDep, nil
 	}
 
 	// The mutator will pause until the newly added dependency has finished running the current mutator,
@@ -3461,7 +3463,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 	}
 
 	reverseDeps := make(map[*moduleInfo][]depInfo)
-	onDemandReverseDeps := make(map[*moduleInfo][]depInfo)
+	onDemandReverseDeps := make(map[*moduleInfo]map[*moduleInfo]bool)
 	var rename []rename
 	var replace []replace
 	var newModules []*moduleInfo
@@ -3576,7 +3578,10 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 					reverseDeps[r.module] = append(reverseDeps[r.module], r.dep)
 				}
 				for _, r := range globalStateChange.onDemandReverseDeps {
-					onDemandReverseDeps[r.module] = append(onDemandReverseDeps[r.module], r.dep)
+					if _, exists := onDemandReverseDeps[r.module]; !exists {
+						onDemandReverseDeps[r.module] = make(map[*moduleInfo]bool)
+					}
+					onDemandReverseDeps[r.module][r.dep.module] = true
 				}
 				replace = append(replace, globalStateChange.replace...)
 				rename = append(rename, globalStateChange.rename...)
@@ -3674,11 +3679,14 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 
 	// Set forward/reverseDeps of on-demand variants.
 	// Sort the deps to ensure deterministic orderding.
-	for module, deps := range onDemandReverseDeps {
-		sort.Sort(depSorter{deps, c.nameInterface})
+	for module, depsAsKeys := range onDemandReverseDeps {
+		deps := slices.Collect(maps.Keys(depsAsKeys))
+		slices.SortFunc(deps, func(a, b *moduleInfo) int {
+			return cmp.Compare(a.variant.name, b.variant.name)
+		})
 		for _, dep := range deps {
-			module.forwardDeps = append(module.forwardDeps, dep.module)
-			dep.module.reverseDeps = append(dep.module.reverseDeps, module)
+			module.forwardDeps = append(module.forwardDeps, dep)
+			dep.reverseDeps = append(dep.reverseDeps, module)
 		}
 		module.newOnDemandReverseDeps = nil
 	}
@@ -3707,10 +3715,63 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}
 
+	// Sort the on-demand variants before adding to moduleGroup.
+	// For variants that belong to the same group, the variants will be ordered by SplitOnDemand values.
+	moduleLess := func(a, b *moduleInfo) int {
+		if a.group != b.group {
+			return cmp.Compare(a.group.name, b.group.name)
+		}
+		// Both modules belong to the same group.
+		// If one module is an inter-variant dep of the other, it goes before.
+		for _, dep := range a.directDeps {
+			if dep.module == b {
+				return 1
+			}
+		}
+		for _, dep := range b.directDeps {
+			if dep.module == a {
+				return -1
+			}
+		}
+		for _, mutator := range c.transitionMutatorNames {
+			aVariant := a.variant.variations.variations[mutator]
+			bVariant := b.variant.variations.variations[mutator]
+			if aVariant != bVariant {
+				aVariantIndex := -1
+				bVariantIndex := -1
+				for index, variant := range a.group.supportedVariantsOnDemand[mutator] {
+					if aVariant == variant.Variation() {
+						aVariantIndex = index
+					}
+					if bVariant == variant.Variation() {
+						bVariantIndex = index
+					}
+				}
+				if aVariantIndex != bVariantIndex {
+					return cmp.Compare(aVariantIndex, bVariantIndex)
+				}
+				return cmp.Compare(aVariant, bVariant)
+			}
+		}
+		return 0
+	}
+
+	slices.SortFunc(onDemandModules, moduleLess)
+
 	for _, module := range onDemandModules {
 		for _, fd := range module.newDirectDeps {
 			fd.reverseDeps = append(fd.reverseDeps, module)
+			// AddVariationDependency allows adding a dependency on itself, but only if
+			// that module is earlier in the module list than this one, since we always
+			// run GenerateBuildActions in order for the variants of a module
+			if fd.group == module.group && beforeInModuleList(module, fd, module.group.modules) {
+				return nil, []error{&BlueprintError{
+					Err: fmt.Errorf("%q depends on later version of itself", module.Name()),
+					Pos: module.pos,
+				}}
+			}
 		}
+
 		module.group.modules = append(module.group.modules, module)
 		// The module has been created and mutated.
 		// For future mutators, this variant is the same as normal variants.
