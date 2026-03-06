@@ -3720,24 +3720,33 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 	}
 
+	// Add the on-demand variant into its module group.
+	// Since there can be inter-variant deps, it needs to be inserted before its inter-variant rdep.
+	insertIntoModuleGroup := func(module *moduleInfo) {
+		isInterVariantDep := false
+		// Check reverseDeps to see if inter-variant rdep exists.
+		for _, rdep := range module.reverseDeps {
+			if rdep.group == module.group {
+				isInterVariantDep = true
+				break
+			}
+		}
+		insertIndex := len(module.group.modules)
+		if isInterVariantDep {
+			insertIndex = slices.IndexFunc(module.group.modules, func(groupModule *moduleInfo) bool {
+				return slices.ContainsFunc(groupModule.directDeps, func(directDep depInfo) bool {
+					return directDep.module == module
+				})
+			})
+			if insertIndex == -1 {
+				insertIndex = len(module.group.modules)
+			}
+		}
+		module.group.modules = slices.Insert(module.group.modules, insertIndex, module)
+	}
 	// Sort the on-demand variants before adding to moduleGroup.
-	// For variants that belong to the same group, the variants will be ordered by SplitOnDemand values.
+	// The variants will be ordered by SplitOnDemand values.
 	moduleLess := func(a, b *moduleInfo) int {
-		if a.group != b.group {
-			return cmp.Compare(a.group.name, b.group.name)
-		}
-		// Both modules belong to the same group.
-		// If one module is an inter-variant dep of the other, it goes before.
-		for _, dep := range a.directDeps {
-			if dep.module == b {
-				return 1
-			}
-		}
-		for _, dep := range b.directDeps {
-			if dep.module == a {
-				return -1
-			}
-		}
 		for _, mutator := range c.transitionMutatorNames {
 			aVariant := a.variant.variations.variations[mutator]
 			bVariant := b.variant.variations.variations[mutator]
@@ -3760,32 +3769,40 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		}
 		return 0
 	}
-
-	slices.SortFunc(onDemandModules, moduleLess)
-
+	// Group the on-demand variants per module group for faster sorting.
+	moduleGroupToOnDemandModules := make(map[*moduleGroup][]*moduleInfo)
 	for _, module := range onDemandModules {
-		for _, fd := range module.newDirectDeps {
-			fd.reverseDeps = append(fd.reverseDeps, module)
-			// AddVariationDependency allows adding a dependency on itself, but only if
-			// that module is earlier in the module list than this one, since we always
-			// run GenerateBuildActions in order for the variants of a module
-			if fd.group == module.group && beforeInModuleList(module, fd, module.group.modules) {
-				return nil, []error{&BlueprintError{
-					Err: fmt.Errorf("%q depends on later version of itself", module.Name()),
-					Pos: module.pos,
-				}}
-			}
-		}
+		moduleGroupToOnDemandModules[module.group] = append(moduleGroupToOnDemandModules[module.group], module)
+	}
+	for moduleGroup := range moduleGroupToOnDemandModules {
+		slices.SortFunc(moduleGroupToOnDemandModules[moduleGroup], moduleLess)
+	}
 
-		module.group.modules = append(module.group.modules, module)
-		// The module has been created and mutated.
-		// For future mutators, this variant is the same as normal variants.
-		// Set this flag to false so that we do not try to call `rerunMutatorsOnVariantOnDemand` again.
-		module.createdOnDemand = false
-		module.createdOnDemandReplaceWith = nil
-		module.newDirectDeps = nil
-		module.newOnDemandReverseDeps = nil
-		module.createdOnDemandSupportedSplits = nil
+	for _, modules := range moduleGroupToOnDemandModules {
+		for _, module := range modules {
+			insertIntoModuleGroup(module)
+			for _, fd := range module.newDirectDeps {
+				fd.reverseDeps = append(fd.reverseDeps, module)
+				// AddVariationDependency allows adding a dependency on itself, but only if
+				// that module is earlier in the module list than this one, since we always
+				// run GenerateBuildActions in order for the variants of a module
+				if fd.group == module.group && beforeInModuleList(module, fd, module.group.modules) {
+					return nil, []error{&BlueprintError{
+						Err: fmt.Errorf("%q depends on later version of itself", module.Name()),
+						Pos: module.pos,
+					}}
+				}
+			}
+
+			// The module has been created and mutated.
+			// For future mutators, this variant is the same as normal variants.
+			// Set this flag to false so that we do not try to call `rerunMutatorsOnVariantOnDemand` again.
+			module.createdOnDemand = false
+			module.createdOnDemandReplaceWith = nil
+			module.newDirectDeps = nil
+			module.newOnDemandReverseDeps = nil
+			module.createdOnDemandSupportedSplits = nil
+		}
 	}
 
 	return deps, errs
