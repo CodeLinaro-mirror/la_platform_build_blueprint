@@ -463,12 +463,12 @@ func (group *moduleGroup) searchOnDemandVariant(onDemandVariants variationMap, f
 //
 // To reduce duplicate reruns, it stores the results in a map.
 func (c *Context) loadOrCreateVariantOnDemand(config any, module *moduleInfo, depTag DependencyTag, possibleDeps *moduleGroup, variant variationMap,
-	requestedVariations []Variation, far bool, moduleOutgoingTransitionInfos []TransitionInfo) (*moduleInfo, []error) {
+	requestedVariations []Variation, far bool) (*moduleInfo, []error) {
 	createVariantOnDemand := func() (*moduleInfo, []error) {
 		var variantOnDemand *moduleInfo
 		var errs []error
 		onDemandVariantForIncomingTransition := c.createVariantOnDemand(possibleDeps, variant)
-		_, _, errs = c.applyTransitions(config, module, depTag, possibleDeps, variant, requestedVariations, far, onDemandVariantForIncomingTransition)
+		_, errs = c.applyTransitions(config, module, depTag, possibleDeps, variant, requestedVariations, far, onDemandVariantForIncomingTransition)
 		if len(errs) > 0 || onDemandVariantForIncomingTransition.createdOnDemandIncompatible {
 			variantOnDemand = nil
 		} else {
@@ -487,12 +487,6 @@ func (c *Context) loadOrCreateVariantOnDemand(config any, module *moduleInfo, de
 	for _, mutator := range slices.Sorted(maps.Keys(variant.variations)) {
 		variantSb.WriteString("-")
 		variantSb.WriteString(variant.variations[mutator])
-	}
-	for _, oti := range moduleOutgoingTransitionInfos {
-		if oti != nil && oti.Variation() != "" {
-			variantSb.WriteString("-")
-			variantSb.WriteString(oti.Variation())
-		}
 	}
 
 	possibleDeps.variantOnDemandLock.Lock()
@@ -689,8 +683,6 @@ type moduleInfo struct {
 	// Properties used to determine whether a requested on-demand variant can be created.
 	createdOnDemandIncompatible    bool
 	createdOnDemandSupportedSplits []TransitionInfo
-	// Index used for sorting primary and on-demand variants. Special-cased to android's image mutator for now.
-	sortIndex int
 }
 
 type providerInfo struct {
@@ -2372,11 +2364,9 @@ func blueprintDepsMutator(ctx BottomUpMutatorContext) {
 // for onDemand: true, a copy of the dependency will be created on demand and used as the context
 // for IncomingTransition.
 func (c *Context) applyTransitions(config any, module *moduleInfo, depTag DependencyTag, group *moduleGroup, variant variationMap,
-	requestedVariations []Variation, far bool, onDemandMatchingVariant *moduleInfo) (variationMap, []TransitionInfo, []error) {
+	requestedVariations []Variation, far bool, onDemandMatchingVariant *moduleInfo) (variationMap, []error) {
 	// Initialize some variables that will be used to manage IncomingTransition context of on demand variants.
 	onDemandFromMutatorIndex := c.mutatorIndexAfterLastCreateModule
-
-	var moduleOutgoingTransitionInfos []TransitionInfo
 
 	for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
 		explicitlyRequested := slices.ContainsFunc(requestedVariations, func(variation Variation) bool {
@@ -2403,9 +2393,8 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 			outgoingTransitionContextPool.Put(ctx)
 			ctx = nil
 			if len(errs) > 0 {
-				return variationMap{}, moduleOutgoingTransitionInfos, errs
+				return variationMap{}, errs
 			}
-			moduleOutgoingTransitionInfos = append(moduleOutgoingTransitionInfos, outgoingTransitionInfo)
 		}
 
 		earlierVariantCreatingMutators := c.transitionMutatorNames[:transitionMutator.index]
@@ -2450,7 +2439,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 			incomingTransitionContextPool.Put(ctx)
 			ctx = nil
 			if len(errs) > 0 {
-				return variationMap{}, moduleOutgoingTransitionInfos, errs
+				return variationMap{}, errs
 			}
 			variation := ""
 			if finalTransitionInfo != nil {
@@ -2473,7 +2462,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 				}
 				if !found {
 					onDemandMatchingVariant.createdOnDemandIncompatible = true
-					return variant, moduleOutgoingTransitionInfos, nil
+					return variant, nil
 				}
 				onDemandMatchingVariant.createdOnDemandSupportedSplits = nil // reset for next transition mutator check.
 			}
@@ -2486,7 +2475,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 		}
 	}
 
-	return variant, moduleOutgoingTransitionInfos, nil
+	return variant, nil
 }
 
 func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyTag,
@@ -2510,11 +2499,10 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 	}
 
 	newVariantBeforeTransitions := newVariant.clone()
-	var moduleOutgoingTransitionInfos []TransitionInfo
 
 	if !reverse {
 		var errs []error
-		newVariant, moduleOutgoingTransitionInfos, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, nil)
+		newVariant, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, nil)
 		if len(errs) > 0 {
 			return nil, variationMap{}, errs
 		}
@@ -2553,7 +2541,7 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 	if foundDep == nil &&
 		!c.allowMissingDependencies && // TODO (b/448182009): Skip checking for possible on-demand variant if allowMissingDependencies is set.
 		possibleDeps.searchOnDemandVariant(newVariantBeforeTransitions, far, mutatorIndex, c.transitionMutators) {
-		if variantOnDemand, errs := c.loadOrCreateVariantOnDemand(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far, moduleOutgoingTransitionInfos); variantOnDemand != nil {
+		if variantOnDemand, errs := c.loadOrCreateVariantOnDemand(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far); variantOnDemand != nil {
 			foundDep = c.createVariantOnDemand(possibleDeps, variantOnDemand.requestedOnDemandVariant.clone())
 			foundDep.finishedMutator = mutatorIndex
 			newVariant = variantOnDemand.requestedOnDemandVariant.clone()
@@ -3830,10 +3818,7 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.group.modules = slices.Insert(module.group.modules, insertIndex, module)
 	}
 
-	moduleGroupsWithOnDemandModules := make(map[*moduleGroup]bool)
-
 	for _, module := range onDemandModules {
-		moduleGroupsWithOnDemandModules[module.group] = true
 		insertIntoModuleGroup(module)
 		for _, fd := range module.newDirectDeps {
 			fd.reverseDeps = append(fd.reverseDeps, module)
@@ -3857,12 +3842,6 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.newOnDemandReverseDeps = nil
 		module.createdOnDemandSupportedSplits = nil
 		module.group.cachedVariantsOnDemand = nil
-	}
-
-	for g := range moduleGroupsWithOnDemandModules {
-		slices.SortStableFunc(g.modules, func(a, b *moduleInfo) int {
-			return cmp.Compare(a.sortIndex, b.sortIndex)
-		})
 	}
 
 	return deps, errs
