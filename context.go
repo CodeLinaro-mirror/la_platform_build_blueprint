@@ -252,7 +252,9 @@ type Context struct {
 	// If splitAllVariants is true, all variants will be created upfront rather than on-demand.
 	splitAllVariants bool
 
-	partialAnalysisTargets []string
+	// index of the first mutator that supports partial analysis.
+	mutatorIndexPartialAnalysis int
+	partialAnalysisTargets      []string
 }
 
 type orderOnlyStringsInfo struct {
@@ -409,6 +411,9 @@ type moduleGroup struct {
 	// Map of requested variation map to on-demand variants.
 	// Set to empty at the end of mutator.
 	cachedVariantsOnDemand map[string]*moduleInfo
+
+	// Indicates the module group is not yet in the build graph.
+	passive bool
 }
 
 func (group *moduleGroup) moduleByVariantName(name string) *moduleInfo {
@@ -926,6 +931,7 @@ type mutatorInfo struct {
 	usesCreateModule        bool
 	mutatesDependencies     bool
 	mutatesGlobalState      bool
+	prePartial              bool
 }
 
 func newContext() *Context {
@@ -1303,6 +1309,8 @@ type MutatorHandle interface {
 	// adjacent mutators into a single mutator pass.
 	MutatesGlobalState() MutatorHandle
 
+	PrePartial() MutatorHandle
+
 	setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle
 }
 
@@ -1333,6 +1341,11 @@ func (mutator *mutatorInfo) MutatesDependencies() MutatorHandle {
 
 func (mutator *mutatorInfo) MutatesGlobalState() MutatorHandle {
 	mutator.mutatesGlobalState = true
+	return mutator
+}
+
+func (mutator *mutatorInfo) PrePartial() MutatorHandle {
+	mutator.prePartial = true
 	return mutator
 }
 
@@ -2299,7 +2312,9 @@ func coalesceMutators(mutators []*mutatorInfo) [][]*mutatorInfo {
 			!m.usesReverseDependencies &&
 			!m.usesRename &&
 			!m.mutatesGlobalState &&
-			!m.mutatesDependencies
+			!m.mutatesDependencies &&
+			// No mix of pre partial marker mutator with others.
+			!m.prePartial
 	}
 
 	for _, mutator := range mutators {
@@ -2922,6 +2937,8 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 	pausedWorkers := 0 // Number of workers that are waiting on an unpause channel
 	workers := 0       // Total number of spawned workers.
 
+	hung := make(map[*moduleInfo]bool)
+
 	cancel := false // will be set when any worker returns an error.
 
 	var queue []*moduleInfo           // The list of modules that are ready to be sent to workers.
@@ -2950,6 +2967,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 	// Initialize waitingCount on each module with the number of modules that need to complete before it can run.
 	// Add any modules whose waitingCount is 0 to the initial queue of ready modules.
 	for module := range moduleIter {
+		hung[module] = true
 		toVisit++
 		waitingCount := order.waitCount(module)
 		module.waitingCount.Store(int32(waitingCount))
@@ -3022,6 +3040,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 		visited += len(response.done)
 		activeModules -= len(response.done)
 		for _, doneModule := range response.done {
+			delete(hung, doneModule)
 			// Mark this module as done.  Nothing else should be updating waitingCount, so a single attempt
 			// at CompareAndSwap should always succeed.  This is the only location that will ever update
 			// waitingCount from 0 to -1, and once it is -1 it will never be changed for the rest of this
@@ -3073,6 +3092,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 			if response.pause.until.createdOnDemand {
 				queue = append(queue, response.pause.until)
 				toVisit++
+				hung[response.pause.until] = true
 				queuedModules++
 			}
 
@@ -3193,7 +3213,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 		// Invariant check: if there was no dependency cycle and no cancellation every module
 		// should have been visited.
 		if visited != toVisit {
-			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d", visited, toVisit))
+			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d. Unvisited modules map: %v. Try rebuilding with SOONG_SPLIT_ALL_VARIANTS=true. Please file a go/soong-bug if build is successful with the environment variable.", visited, toVisit, hung))
 		}
 	}
 
@@ -3438,15 +3458,48 @@ func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGr
 
 	pprof.Do(ctx, pprof.Labels("blueprint", "runMutators"), func(ctx context.Context) {
 		mutatorIndexAfterLastCreateModule := -1
+		mutatorIndexPartialAnalysis := -1
 		for i := len(mutatorGroups) - 1; i >= 0; i-- {
-			if mutatorGroups[i][0].usesCreateModule {
+			if mutatorIndexAfterLastCreateModule == -1 && mutatorGroups[i][0].usesCreateModule {
 				mutatorIndexAfterLastCreateModule = mutatorGroups[i][0].index
-				break
+			}
+			if mutatorIndexPartialAnalysis == -1 && mutatorGroups[i][0].prePartial {
+				mutatorIndexPartialAnalysis = mutatorGroups[i][0].index
 			}
 		}
 		c.mutatorIndexAfterLastCreateModule = mutatorIndexAfterLastCreateModule + 1
+		c.mutatorIndexPartialAnalysis = mutatorIndexPartialAnalysis + 1
 
 		for _, mutatorGroup := range mutatorGroups {
+			if mutatorGroup[0].index == c.mutatorIndexPartialAnalysis && len(c.partialAnalysisTargets) > 0 {
+				targetMap := make(map[string]bool, len(c.partialAnalysisTargets))
+				for _, t := range c.partialAnalysisTargets {
+					targetMap[t] = false
+				}
+
+				foundCount := 0
+				for _, m := range c.moduleGroups {
+					if alreadyFound, isTarget := targetMap[m.name]; isTarget {
+						m.passive = false
+						if !alreadyFound {
+							targetMap[m.name] = true
+							foundCount++
+						}
+					} else {
+						m.passive = true
+					}
+				}
+
+				if foundCount < len(targetMap) {
+					notFound := make([]string, 0, len(targetMap)-foundCount)
+					for target, found := range targetMap {
+						if !found {
+							notFound = append(notFound, target)
+						}
+					}
+					panic(fmt.Sprintf("the requested targets are not found: %v", notFound))
+				}
+			}
 			name := mutatorGroup[0].name
 			if len(mutatorGroup) > 1 {
 				name += "_plus_" + strconv.Itoa(len(mutatorGroup)-1)
