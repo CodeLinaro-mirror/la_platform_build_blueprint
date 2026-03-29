@@ -261,8 +261,7 @@ func (t *transitionMutatorImpl) propagateMutator(mctx BaseModuleContext) {
 		panic(fmt.Errorf("transition mutator %s returned no splits for module %s", t.name, mctx.ModuleName()))
 	}
 	if module.createdOnDemand {
-		allSplits := append(mutatorSplits, t.mutator.SplitOnDemand(mctx)...)
-		module.createdOnDemandSupportedSplits = append(module.createdOnDemandSupportedSplits, allSplits...)
+		module.createdOnDemandSupportedSplits = append(mutatorSplits, t.mutator.SplitOnDemand(mctx)...)
 		return
 	}
 
@@ -425,6 +424,10 @@ func (t *transitionMutatorImpl) transition(mctx BaseModuleContext) Transition {
 
 func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 	mc := mctx.(*mutatorContext)
+
+	// Assumes that each android tranition mutator does not create more than 16 splits.
+	sortIndexBuffer := 16
+
 	// on demand variant.
 	if mc.module.createdOnDemand {
 		variant, _ := mc.module.requestedOnDemandVariant.variations[t.name]
@@ -432,9 +435,10 @@ func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 		onDemandVariantInfo := t.mutator.TransitionInfoFromVariation(variant)
 		mc.context.setModuleTransitionInfo(mc.module, t, onDemandVariantInfo)
 		// TODO (b/448182248): remove the image special case.
-		if t.name == "image" {
-			splits := append(t.mutator.Split(mctx), t.mutator.SplitOnDemand(mctx)...)
-			mc.module.sortIndex = slices.Index(splits, onDemandVariantInfo)
+		if t.name == "image" || t.name == "arch" {
+			mc.module.sortIndex =
+				sortIndexBuffer*mc.module.sortIndex +
+					slices.Index(mc.module.createdOnDemandSupportedSplits, onDemandVariantInfo)
 		}
 		return
 	}
@@ -466,9 +470,9 @@ func (t *transitionMutatorImpl) bottomUpMutator(mctx BottomUpMutatorContext) {
 	} else {
 		modules := mc.createVariationsWithTransition(variations, outgoingTransitionCache)
 		for i, module := range modules {
-			if t.name == "image" {
+			if t.name == "image" || t.name == "arch" {
 				// TODO (b/448182248): remove the image special case.
-				module.sortIndex = i
+				module.sortIndex = sortIndexBuffer*module.sortIndex + i
 			}
 			mc.context.setModuleTransitionInfo(module, t, transitionInfos[i])
 		}
