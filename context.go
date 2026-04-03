@@ -252,7 +252,9 @@ type Context struct {
 	// If splitAllVariants is true, all variants will be created upfront rather than on-demand.
 	splitAllVariants bool
 
-	partialAnalysisTargets []string
+	// index of the first mutator that supports partial analysis.
+	mutatorIndexPartialAnalysis int
+	partialAnalysisTargets      []string
 }
 
 type orderOnlyStringsInfo struct {
@@ -409,6 +411,9 @@ type moduleGroup struct {
 	// Map of requested variation map to on-demand variants.
 	// Set to empty at the end of mutator.
 	cachedVariantsOnDemand map[string]*moduleInfo
+
+	// Indicates the module group is not yet in the build graph.
+	passive bool
 }
 
 func (group *moduleGroup) moduleByVariantName(name string) *moduleInfo {
@@ -463,12 +468,12 @@ func (group *moduleGroup) searchOnDemandVariant(onDemandVariants variationMap, f
 //
 // To reduce duplicate reruns, it stores the results in a map.
 func (c *Context) loadOrCreateVariantOnDemand(config any, module *moduleInfo, depTag DependencyTag, possibleDeps *moduleGroup, variant variationMap,
-	requestedVariations []Variation, far bool) (*moduleInfo, []error) {
+	requestedVariations []Variation, far bool, moduleOutgoingTransitionInfos []TransitionInfo) (*moduleInfo, []error) {
 	createVariantOnDemand := func() (*moduleInfo, []error) {
 		var variantOnDemand *moduleInfo
 		var errs []error
 		onDemandVariantForIncomingTransition := c.createVariantOnDemand(possibleDeps, variant)
-		_, errs = c.applyTransitions(config, module, depTag, possibleDeps, variant, requestedVariations, far, onDemandVariantForIncomingTransition)
+		_, _, errs = c.applyTransitions(config, module, depTag, possibleDeps, variant, requestedVariations, far, onDemandVariantForIncomingTransition)
 		if len(errs) > 0 || onDemandVariantForIncomingTransition.createdOnDemandIncompatible {
 			variantOnDemand = nil
 		} else {
@@ -487,6 +492,16 @@ func (c *Context) loadOrCreateVariantOnDemand(config any, module *moduleInfo, de
 	for _, mutator := range slices.Sorted(maps.Keys(variant.variations)) {
 		variantSb.WriteString("-")
 		variantSb.WriteString(variant.variations[mutator])
+	}
+	for _, mutator := range slices.Sorted(maps.Keys(module.requestedOnDemandVariant.variations)) {
+		variantSb.WriteString("-")
+		variantSb.WriteString(variant.variations[mutator])
+	}
+	for _, oti := range moduleOutgoingTransitionInfos {
+		if oti != nil && oti.Variation() != "" {
+			variantSb.WriteString("-")
+			variantSb.WriteString(oti.Variation())
+		}
 	}
 
 	possibleDeps.variantOnDemandLock.Lock()
@@ -683,6 +698,8 @@ type moduleInfo struct {
 	// Properties used to determine whether a requested on-demand variant can be created.
 	createdOnDemandIncompatible    bool
 	createdOnDemandSupportedSplits []TransitionInfo
+	// Index used for sorting primary and on-demand variants. Special-cased to android's image mutator for now.
+	sortIndex int
 }
 
 type providerInfo struct {
@@ -918,6 +935,7 @@ type mutatorInfo struct {
 	usesCreateModule        bool
 	mutatesDependencies     bool
 	mutatesGlobalState      bool
+	prePartial              bool
 }
 
 func newContext() *Context {
@@ -1295,6 +1313,8 @@ type MutatorHandle interface {
 	// adjacent mutators into a single mutator pass.
 	MutatesGlobalState() MutatorHandle
 
+	PrePartial() MutatorHandle
+
 	setTransitionMutator(impl *transitionMutatorImpl) MutatorHandle
 }
 
@@ -1325,6 +1345,11 @@ func (mutator *mutatorInfo) MutatesDependencies() MutatorHandle {
 
 func (mutator *mutatorInfo) MutatesGlobalState() MutatorHandle {
 	mutator.mutatesGlobalState = true
+	return mutator
+}
+
+func (mutator *mutatorInfo) PrePartial() MutatorHandle {
+	mutator.prePartial = true
 	return mutator
 }
 
@@ -2291,7 +2316,9 @@ func coalesceMutators(mutators []*mutatorInfo) [][]*mutatorInfo {
 			!m.usesReverseDependencies &&
 			!m.usesRename &&
 			!m.mutatesGlobalState &&
-			!m.mutatesDependencies
+			!m.mutatesDependencies &&
+			// No mix of pre partial marker mutator with others.
+			!m.prePartial
 	}
 
 	for _, mutator := range mutators {
@@ -2364,9 +2391,11 @@ func blueprintDepsMutator(ctx BottomUpMutatorContext) {
 // for onDemand: true, a copy of the dependency will be created on demand and used as the context
 // for IncomingTransition.
 func (c *Context) applyTransitions(config any, module *moduleInfo, depTag DependencyTag, group *moduleGroup, variant variationMap,
-	requestedVariations []Variation, far bool, onDemandMatchingVariant *moduleInfo) (variationMap, []error) {
+	requestedVariations []Variation, far bool, onDemandMatchingVariant *moduleInfo) (variationMap, []TransitionInfo, []error) {
 	// Initialize some variables that will be used to manage IncomingTransition context of on demand variants.
 	onDemandFromMutatorIndex := c.mutatorIndexAfterLastCreateModule
+
+	var moduleOutgoingTransitionInfos []TransitionInfo
 
 	for _, transitionMutator := range c.transitionMutators[:c.completedTransitionMutators] {
 		explicitlyRequested := slices.ContainsFunc(requestedVariations, func(variation Variation) bool {
@@ -2393,8 +2422,9 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 			outgoingTransitionContextPool.Put(ctx)
 			ctx = nil
 			if len(errs) > 0 {
-				return variationMap{}, errs
+				return variationMap{}, moduleOutgoingTransitionInfos, errs
 			}
+			moduleOutgoingTransitionInfos = append(moduleOutgoingTransitionInfos, outgoingTransitionInfo)
 		}
 
 		earlierVariantCreatingMutators := c.transitionMutatorNames[:transitionMutator.index]
@@ -2439,7 +2469,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 			incomingTransitionContextPool.Put(ctx)
 			ctx = nil
 			if len(errs) > 0 {
-				return variationMap{}, errs
+				return variationMap{}, moduleOutgoingTransitionInfos, errs
 			}
 			variation := ""
 			if finalTransitionInfo != nil {
@@ -2462,7 +2492,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 				}
 				if !found {
 					onDemandMatchingVariant.createdOnDemandIncompatible = true
-					return variant, nil
+					return variant, moduleOutgoingTransitionInfos, nil
 				}
 				onDemandMatchingVariant.createdOnDemandSupportedSplits = nil // reset for next transition mutator check.
 			}
@@ -2475,7 +2505,7 @@ func (c *Context) applyTransitions(config any, module *moduleInfo, depTag Depend
 		}
 	}
 
-	return variant, nil
+	return variant, moduleOutgoingTransitionInfos, nil
 }
 
 func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyTag,
@@ -2499,10 +2529,11 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 	}
 
 	newVariantBeforeTransitions := newVariant.clone()
+	var moduleOutgoingTransitionInfos []TransitionInfo
 
 	if !reverse {
 		var errs []error
-		newVariant, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, nil)
+		newVariant, moduleOutgoingTransitionInfos, errs = c.applyTransitions(config, module, depTag, possibleDeps, newVariant, requestedVariations, far, nil)
 		if len(errs) > 0 {
 			return nil, variationMap{}, errs
 		}
@@ -2541,7 +2572,7 @@ func (c *Context) findVariant(config any, module *moduleInfo, depTag DependencyT
 	if foundDep == nil &&
 		!c.allowMissingDependencies && // TODO (b/448182009): Skip checking for possible on-demand variant if allowMissingDependencies is set.
 		possibleDeps.searchOnDemandVariant(newVariantBeforeTransitions, far, mutatorIndex, c.transitionMutators) {
-		if variantOnDemand, errs := c.loadOrCreateVariantOnDemand(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far); variantOnDemand != nil {
+		if variantOnDemand, errs := c.loadOrCreateVariantOnDemand(config, module, depTag, possibleDeps, newVariantBeforeTransitions, requestedVariations, far, moduleOutgoingTransitionInfos); variantOnDemand != nil {
 			foundDep = c.createVariantOnDemand(possibleDeps, variantOnDemand.requestedOnDemandVariant.clone())
 			foundDep.finishedMutator = mutatorIndex
 			newVariant = variantOnDemand.requestedOnDemandVariant.clone()
@@ -2910,6 +2941,8 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 	pausedWorkers := 0 // Number of workers that are waiting on an unpause channel
 	workers := 0       // Total number of spawned workers.
 
+	hung := make(map[*moduleInfo]bool)
+
 	cancel := false // will be set when any worker returns an error.
 
 	var queue []*moduleInfo           // The list of modules that are ready to be sent to workers.
@@ -2938,6 +2971,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 	// Initialize waitingCount on each module with the number of modules that need to complete before it can run.
 	// Add any modules whose waitingCount is 0 to the initial queue of ready modules.
 	for module := range moduleIter {
+		hung[module] = true
 		toVisit++
 		waitingCount := order.waitCount(module)
 		module.waitingCount.Store(int32(waitingCount))
@@ -3010,6 +3044,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 		visited += len(response.done)
 		activeModules -= len(response.done)
 		for _, doneModule := range response.done {
+			delete(hung, doneModule)
 			// Mark this module as done.  Nothing else should be updating waitingCount, so a single attempt
 			// at CompareAndSwap should always succeed.  This is the only location that will ever update
 			// waitingCount from 0 to -1, and once it is -1 it will never be changed for the rest of this
@@ -3061,6 +3096,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 			if response.pause.until.createdOnDemand {
 				queue = append(queue, response.pause.until)
 				toVisit++
+				hung[response.pause.until] = true
 				queuedModules++
 			}
 
@@ -3181,7 +3217,7 @@ func parallelVisit(moduleIter iter.Seq[*moduleInfo], order visitOrderer, limit i
 		// Invariant check: if there was no dependency cycle and no cancellation every module
 		// should have been visited.
 		if visited != toVisit {
-			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d", visited, toVisit))
+			panic(fmt.Errorf("parallelVisit ran %d visitors, expected %d. Unvisited modules map: %v. Try rebuilding with SOONG_SPLIT_ALL_VARIANTS=true. Please file a go/soong-bug if build is successful with the environment variable.", visited, toVisit, hung))
 		}
 	}
 
@@ -3426,15 +3462,48 @@ func (c *Context) runMutators(ctx context.Context, config interface{}, mutatorGr
 
 	pprof.Do(ctx, pprof.Labels("blueprint", "runMutators"), func(ctx context.Context) {
 		mutatorIndexAfterLastCreateModule := -1
+		mutatorIndexPartialAnalysis := -1
 		for i := len(mutatorGroups) - 1; i >= 0; i-- {
-			if mutatorGroups[i][0].usesCreateModule {
+			if mutatorIndexAfterLastCreateModule == -1 && mutatorGroups[i][0].usesCreateModule {
 				mutatorIndexAfterLastCreateModule = mutatorGroups[i][0].index
-				break
+			}
+			if mutatorIndexPartialAnalysis == -1 && mutatorGroups[i][0].prePartial {
+				mutatorIndexPartialAnalysis = mutatorGroups[i][0].index
 			}
 		}
 		c.mutatorIndexAfterLastCreateModule = mutatorIndexAfterLastCreateModule + 1
+		c.mutatorIndexPartialAnalysis = mutatorIndexPartialAnalysis + 1
 
 		for _, mutatorGroup := range mutatorGroups {
+			if mutatorGroup[0].index == c.mutatorIndexPartialAnalysis && len(c.partialAnalysisTargets) > 0 {
+				targetMap := make(map[string]bool, len(c.partialAnalysisTargets))
+				for _, t := range c.partialAnalysisTargets {
+					targetMap[t] = false
+				}
+
+				foundCount := 0
+				for _, m := range c.moduleGroups {
+					if alreadyFound, isTarget := targetMap[m.name]; isTarget {
+						m.passive = false
+						if !alreadyFound {
+							targetMap[m.name] = true
+							foundCount++
+						}
+					} else {
+						m.passive = true
+					}
+				}
+
+				if foundCount < len(targetMap) {
+					notFound := make([]string, 0, len(targetMap)-foundCount)
+					for target, found := range targetMap {
+						if !found {
+							notFound = append(notFound, target)
+						}
+					}
+					panic(fmt.Sprintf("the requested targets are not found: %v", notFound))
+				}
+			}
 			name := mutatorGroup[0].name
 			if len(mutatorGroup) > 1 {
 				name += "_plus_" + strconv.Itoa(len(mutatorGroup)-1)
@@ -3818,7 +3887,10 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.group.modules = slices.Insert(module.group.modules, insertIndex, module)
 	}
 
+	moduleGroupsWithOnDemandModules := make(map[*moduleGroup]bool)
+
 	for _, module := range onDemandModules {
+		moduleGroupsWithOnDemandModules[module.group] = true
 		insertIntoModuleGroup(module)
 		for _, fd := range module.newDirectDeps {
 			fd.reverseDeps = append(fd.reverseDeps, module)
@@ -3842,6 +3914,12 @@ func (c *Context) runMutator(config interface{}, mutatorGroup []*mutatorInfo,
 		module.newOnDemandReverseDeps = nil
 		module.createdOnDemandSupportedSplits = nil
 		module.group.cachedVariantsOnDemand = nil
+	}
+
+	for g := range moduleGroupsWithOnDemandModules {
+		slices.SortStableFunc(g.modules, func(a, b *moduleInfo) int {
+			return cmp.Compare(a.sortIndex, b.sortIndex)
+		})
 	}
 
 	return deps, errs
