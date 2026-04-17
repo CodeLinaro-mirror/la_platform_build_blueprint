@@ -73,9 +73,10 @@ type RuleParams struct {
 	Source          string  // A string identify the source of this rule, used to dedup rules in the reporting of certain metrics
 
 	// These fields are used internally in Blueprint
-	CommandDeps      []string // Command-specific implicit dependencies to prepend to builds
-	CommandOrderOnly []string // Command-specific order-only dependencies to prepend to builds
-	Comment          string   // The comment that will appear above the definition.
+	CommandDeps      []string   // Command-specific implicit dependencies to prepend to builds
+	CommandDepsTools []HostTool // Command-specific implicit dependencies, but host tools, used to update CommandDeps
+	CommandOrderOnly []string   // Command-specific order-only dependencies to prepend to builds
+	Comment          string     // The comment that will appear above the definition.
 }
 
 // A command that ninja will run. It's an interpolation of strings and references to host tools,
@@ -96,7 +97,7 @@ func (c *Command) getCommandAndDeps(config any) (string, []string, error) {
 		case string:
 			result.WriteString(p)
 		case HostTool:
-			cmd, newDeps, err := p.getValueAndDeps(config)
+			cmd, newDeps, err := p.GetValueAndDeps(config)
 			if err != nil {
 				return "", nil, err
 			}
@@ -130,7 +131,10 @@ type hostToolInner struct {
 	err   error
 }
 
-func (h *HostTool) getValueAndDeps(config any) (string, []string, error) {
+// Gets the value (the string to put in the command line) and deps of this host tool.
+// Generally, you shouldn't call this, you should pass the HostTool to a blueprint.NewCommand().
+// However in some cases where we build a command from strings it's necessary.
+func (h *HostTool) GetValueAndDeps(config any) (string, []string, error) {
 	h.inner.once.Do(func() {
 		params, err := h.inner.f(config)
 		h.inner.value = params.Value
@@ -249,6 +253,16 @@ func parseRuleParams(config any, scope scope, params *RuleParams) (*ruleDef, err
 		}
 		params.Command = cmd
 		params.CommandDeps = append(params.CommandDeps, deps...)
+	}
+
+	if params.CommandDepsTools != nil {
+		for _, hostTool := range params.CommandDepsTools {
+			_, deps, err := hostTool.GetValueAndDeps(config)
+			if err != nil {
+				return nil, err
+			}
+			params.CommandDeps = append(params.CommandDeps, deps...)
+		}
 	}
 
 	if r.Pool != nil && !scope.IsPoolVisible(r.Pool) {
